@@ -95,6 +95,17 @@ in
       default = 8;
       description = "Memory always left for the host when deciding to boot another VM.";
     };
+    memOvercommit = lib.mkOption {
+      type = lib.types.float;
+      default = 0.0;
+      example = 0.3;
+      description = ''
+        How far the memory given to the VMs may exceed the host's, less
+        `memReserveGiB`; 0.3 lets them add up to 130% of it. VMs return the
+        memory they free, so they rarely use all they were given at once.
+        Another VM still only boots while the host has its memory available.
+      '';
+    };
 
     network = {
       bridge = lib.mkOption {
@@ -183,6 +194,7 @@ in
                 "--slots=${lib.concatStringsSep "," slotNames}"
                 "--vm-mem=${toString cfg.vm.memGiB}"
                 "--mem-reserve=${toString cfg.memReserveGiB}"
+                "--mem-overcommit=${toString cfg.memOvercommit}"
                 "--max-load-per-cpu=${toString cfg.maxLoadPerCpu}"
               ]
             );

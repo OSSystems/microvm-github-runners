@@ -74,6 +74,9 @@ in
     microvm = {
       hypervisor = "qemu";
       inherit (cfg) vcpu mem;
+      # Free page reporting: memory a job frees goes back to the host instead
+      # of staying with the VM until it powers off.
+      balloon = true;
       vsock.cid = cfg.cid;
       interfaces = [
         {
@@ -98,6 +101,9 @@ in
         {
           image = "var.img";
           mountPoint = "/var";
+          # The guest caches the disk already; the host caching it too would
+          # count against the VM's memory.
+          direct = true;
           size = cfg.diskGiB * 1024;
         }
       ];
