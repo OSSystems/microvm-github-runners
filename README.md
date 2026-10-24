@@ -26,8 +26,10 @@ Here each job gets:
 ## How it scales
 
 `microvm-scaleset` registers a [runner scale set](https://github.com/actions/scaleset#what-is-a-scale-set)
-and tells GitHub how many jobs the host can take right now. It boots one VM
-from a pool per assigned job, and grows only while:
+in every organization listed in `urls` and tells GitHub how many jobs the host
+can take right now. All scale sets share one pool of VMs: an idle organization
+holds no slots, and when several have jobs waiting, free VMs go to them in
+turn. It boots one VM from the pool per assigned job, and grows only while:
 
 - the 1-minute load average per CPU is below `maxLoadPerCpu`, and
 - available memory still covers another VM after `memReserveGiB` and the
@@ -47,7 +49,10 @@ instead of overloading the machine.
 
   services.microvm-github-runners = {
     enable = true;
-    url = "https://github.com/my-org";
+    urls = [                        # all share the VM pool
+      "https://github.com/my-org"
+      "https://github.com/my-other-org"
+    ];
     name = "my-microvm";            # workflows use `runs-on: my-microvm`
     githubApp = {
       id = "123456";
@@ -68,7 +73,7 @@ instead of overloading the machine.
 ```
 
 The GitHub App needs organization *Self-hosted runners: read & write*
-permission.
+permission and must be installed on every organization in `urls`.
 
 The host needs KVM. VMs use QEMU, a `/24` bridge with NAT (`network.subnet`,
 default `10.231.0`) and vsock CIDs 3 and up.

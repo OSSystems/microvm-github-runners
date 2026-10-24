@@ -1,5 +1,5 @@
 # Runs GitHub Actions jobs in throwaway microVMs. microvm-scaleset boots VMs
-# from a pool while the host has room, each with a fresh disk and a
+# from one pool shared by every organization while the host has room, each with a fresh disk and a
 # just-in-time runner config, so the GitHub App key never enters a VM and
 # nothing outlives the job.
 {
@@ -22,17 +22,31 @@ let
   slotNames = map (s: s.name) slots;
 in
 {
+  imports = [
+    (lib.mkChangedOptionModule
+      [ "services" "microvm-github-runners" "url" ]
+      [ "services" "microvm-github-runners" "urls" ]
+      (config: [ config.services.microvm-github-runners.url ])
+    )
+  ];
+
   options.services.microvm-github-runners = {
     enable = lib.mkEnableOption "GitHub Actions runners in throwaway microVMs";
 
-    url = lib.mkOption {
-      type = lib.types.str;
-      example = "https://github.com/my-org";
-      description = "Organization or repository the scale set registers with.";
+    urls = lib.mkOption {
+      type = lib.types.nonEmptyListOf lib.types.str;
+      example = [
+        "https://github.com/my-org"
+        "https://github.com/my-other-org"
+      ];
+      description = ''
+        Organizations to register a scale set with. They all share the VM
+        pool, so jobs of a busy organization use the VMs idle ones leave.
+      '';
     };
     name = lib.mkOption {
       type = lib.types.str;
-      description = "Scale set name; also prefixes the VM names.";
+      description = "Scale set name in every organization; also prefixes the VM names.";
     };
     labels = lib.mkOption {
       type = lib.types.listOf lib.types.str;
@@ -54,7 +68,7 @@ in
     poolSize = lib.mkOption {
       type = lib.types.ints.positive;
       default = 8;
-      description = "Most VMs that may run at once; how many do depends on load.";
+      description = "Most VMs that may run at once, across all organizations; how many do depends on load.";
     };
     vm = {
       memGiB = lib.mkOption {
@@ -158,18 +172,20 @@ in
           after = [ "network-online.target" ];
           path = [ config.systemd.package ];
           serviceConfig = {
-            ExecStart = lib.escapeShellArgs [
-              (lib.getExe package)
-              "--url=${cfg.url}"
-              "--name=${cfg.name}"
-              "--labels=${lib.concatStringsSep "," cfg.labels}"
-              "--app-id=${cfg.githubApp.id}"
-              "--private-key-file=${cfg.githubApp.privateKeyFile}"
-              "--slots=${lib.concatStringsSep "," slotNames}"
-              "--vm-mem=${toString cfg.vm.memGiB}"
-              "--mem-reserve=${toString cfg.memReserveGiB}"
-              "--max-load-per-cpu=${toString cfg.maxLoadPerCpu}"
-            ];
+            ExecStart = lib.escapeShellArgs (
+              [ (lib.getExe package) ]
+              ++ map (url: "--url=${url}") cfg.urls
+              ++ [
+                "--name=${cfg.name}"
+                "--labels=${lib.concatStringsSep "," cfg.labels}"
+                "--app-id=${cfg.githubApp.id}"
+                "--private-key-file=${cfg.githubApp.privateKeyFile}"
+                "--slots=${lib.concatStringsSep "," slotNames}"
+                "--vm-mem=${toString cfg.vm.memGiB}"
+                "--mem-reserve=${toString cfg.memReserveGiB}"
+                "--max-load-per-cpu=${toString cfg.maxLoadPerCpu}"
+              ]
+            );
             Restart = "always";
             RestartSec = "10s";
           };

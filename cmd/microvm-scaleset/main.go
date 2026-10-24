@@ -1,7 +1,9 @@
-// microvm-scaleset runs a GitHub Actions runner scale set whose runners are
-// throwaway microVMs. The number of VMs grows with demand for as long as the
-// host has spare CPU and memory, so a busy host stops taking new work
-// instead of overcommitting.
+// microvm-scaleset runs GitHub Actions runner scale sets whose runners are
+// throwaway microVMs. Every organization gets its own scale set, but all of
+// them draw from one pool of VMs, so an idle organization leaves its share to
+// the busy ones. The number of VMs grows with demand for as long as the host
+// has spare CPU and memory, so a busy host stops taking new work instead of
+// overcommitting.
 package main
 
 import (
@@ -23,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,7 +35,7 @@ import (
 )
 
 type config struct {
-	url            string
+	urls           []string
 	name           string
 	labels         string
 	appID          string
@@ -47,8 +50,11 @@ type config struct {
 
 func main() {
 	var c config
-	flag.StringVar(&c.url, "url", "", "organization URL, e.g. https://github.com/shellhub-io")
-	flag.StringVar(&c.name, "name", "", "scale set name")
+	flag.Func("url", "organization URL, e.g. https://github.com/shellhub-io; repeat to share the pool between organizations", func(v string) error {
+		c.urls = append(c.urls, v)
+		return nil
+	})
+	flag.StringVar(&c.name, "name", "", "scale set name, the same in every organization")
 	flag.StringVar(&c.labels, "labels", "", "comma-separated labels (defaults to the name)")
 	flag.StringVar(&c.appID, "app-id", "", "GitHub App ID")
 	flag.StringVar(&c.privateKeyFile, "private-key-file", "", "GitHub App private key")
@@ -71,165 +77,265 @@ func main() {
 }
 
 func run(ctx context.Context, logger *slog.Logger, c config) error {
+	if len(c.urls) == 0 {
+		return errors.New("no --url given")
+	}
 	key, err := os.ReadFile(c.privateKeyFile)
 	if err != nil {
 		return err
 	}
-	org := filepath.Base(strings.TrimSuffix(c.url, "/"))
-	installationID, err := installationID(ctx, c.appID, key, org)
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	p := &pool{
+		cfg:     c,
+		logger:  logger,
+		slots:   strings.Split(c.slots, ","),
+		booting: map[string]time.Time{},
+		owners:  map[string]owner{},
+	}
+	for _, url := range c.urls {
+		s, err := p.register(ctx, url, key)
+		if err != nil {
+			return err
+		}
+		defer s.session.Close(context.WithoutCancel(ctx))
+	}
+
+	var wg sync.WaitGroup
+	for _, s := range p.sets {
+		wg.Go(func() {
+			cancel(fmt.Errorf("%s: %w", s.org, s.listener.Run(ctx, s)))
+		})
+	}
+	// A listener only asks for runners when GitHub answers its long poll, so
+	// slots another organization frees are handed out from here too.
+	wg.Go(func() {
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				p.mu.Lock()
+				p.reconcile(ctx)
+				p.mu.Unlock()
+			}
+		}
+	})
+	wg.Wait()
+	return context.Cause(ctx)
+}
+
+// pool hands one set of microVMs to the scale sets of every organization.
+type pool struct {
+	cfg        config
+	logger     *slog.Logger
+	sets       []*scaleSet
+	slots      []string
+	mu         sync.Mutex
+	busyReason string
+	// booting holds slots started recently; systemd reports them inactive
+	// until their start job runs.
+	booting map[string]time.Time
+	// owners maps each slot to the scale set and runner it was last booted
+	// with.
+	owners map[string]owner
+	// next is the scale set that gets the next free slot, so a busy
+	// organization cannot starve the others.
+	next int
+}
+
+type owner struct {
+	set    *scaleSet
+	runner string
+}
+
+type scaleSet struct {
+	pool     *pool
+	org      string
+	logger   *slog.Logger
+	client   *scaleset.Client
+	id       int
+	session  *scaleset.MessageSessionClient
+	listener *listener.Listener
+	// assigned is how many jobs GitHub last said this scale set has.
+	assigned int
+	capacity int
+}
+
+func (p *pool) register(ctx context.Context, url string, key []byte) (*scaleSet, error) {
+	org := filepath.Base(strings.TrimSuffix(url, "/"))
+	logger := p.logger.With("org", org)
+	installationID, err := installationID(ctx, p.cfg.appID, key, org)
 	if err != nil {
-		return fmt.Errorf("looking up the App installation: %w", err)
+		return nil, fmt.Errorf("looking up the App installation on %s: %w", org, err)
 	}
 
 	client, err := scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
-		GitHubConfigURL: c.url,
+		GitHubConfigURL: url,
 		GitHubAppAuth: scaleset.GitHubAppAuth{
-			ClientID:       c.appID,
+			ClientID:       p.cfg.appID,
 			InstallationID: installationID,
 			PrivateKey:     string(key),
 		},
 		SystemInfo: scaleset.SystemInfo{System: "microvm-scaleset"},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	labels := []scaleset.Label{}
-	for _, l := range strings.Split(c.labels, ",") {
+	for _, l := range strings.Split(p.cfg.labels, ",") {
 		if l = strings.TrimSpace(l); l != "" {
 			labels = append(labels, scaleset.Label{Name: l})
 		}
 	}
 	want := &scaleset.RunnerScaleSet{
-		Name:          c.name,
+		Name:          p.cfg.name,
 		RunnerGroupID: 1,
 		Labels:        labels,
 		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true},
 	}
-	scaleSet, err := client.GetRunnerScaleSet(ctx, 1, c.name)
+	set, err := client.GetRunnerScaleSet(ctx, 1, p.cfg.name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if scaleSet == nil {
-		scaleSet, err = client.CreateRunnerScaleSet(ctx, want)
+	if set == nil {
+		set, err = client.CreateRunnerScaleSet(ctx, want)
 	} else {
-		scaleSet, err = client.UpdateRunnerScaleSet(ctx, scaleSet.ID, want)
+		set, err = client.UpdateRunnerScaleSet(ctx, set.ID, want)
 	}
 	if err != nil {
-		return fmt.Errorf("registering scale set %s: %w", c.name, err)
+		return nil, fmt.Errorf("registering scale set %s on %s: %w", p.cfg.name, org, err)
 	}
-	client.SetSystemInfo(scaleset.SystemInfo{System: "microvm-scaleset", ScaleSetID: scaleSet.ID})
-	logger.Info("scale set ready", "id", scaleSet.ID, "name", scaleSet.Name)
+	client.SetSystemInfo(scaleset.SystemInfo{System: "microvm-scaleset", ScaleSetID: set.ID})
+	logger.Info("scale set ready", "id", set.ID, "name", set.Name)
 
 	hostname, _ := os.Hostname()
-	session, err := client.MessageSessionClient(ctx, scaleSet.ID, hostname)
+	session, err := client.MessageSessionClient(ctx, set.ID, hostname)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer session.Close(context.WithoutCancel(ctx))
-
-	slots := strings.Split(c.slots, ",")
 	l, err := listener.New(session, listener.Config{
-		ScaleSetID: scaleSet.ID,
-		MaxRunners: len(slots),
+		ScaleSetID: set.ID,
+		MaxRunners: len(p.slots),
 		Logger:     logger.WithGroup("listener"),
 	})
 	if err != nil {
-		return err
+		session.Close(context.WithoutCancel(ctx))
+		return nil, err
 	}
 
-	s := &scaler{
-		cfg:        c,
-		logger:     logger,
-		client:     client,
-		scaleSetID: scaleSet.ID,
-		slots:      slots,
-		listener:   l,
-		booting:    map[string]time.Time{},
-		runners:    map[string]string{},
+	s := &scaleSet{
+		pool:     p,
+		org:      org,
+		logger:   logger,
+		client:   client,
+		id:       set.ID,
+		session:  session,
+		listener: l,
 	}
-	return l.Run(ctx, s)
+	p.sets = append(p.sets, s)
+	return s, nil
 }
 
-type scaler struct {
-	cfg        config
-	logger     *slog.Logger
-	client     *scaleset.Client
-	scaleSetID int
-	slots      []string
-	listener   *listener.Listener
-	busyReason string
-	capacity   int
-	// booting holds slots started recently; systemd reports them inactive
-	// until their start job runs.
-	booting map[string]time.Time
-	// runners maps each slot to the runner it was last booted with.
-	runners map[string]string
-}
-
-func (s *scaler) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) error {
+func (s *scaleSet) HandleJobStarted(_ context.Context, job *scaleset.JobStarted) error {
 	s.logger.Info("job started", "runner", job.RunnerName, "job", job.JobID)
 	return nil
 }
 
-func (s *scaler) HandleJobCompleted(_ context.Context, job *scaleset.JobCompleted) error {
+func (s *scaleSet) HandleJobCompleted(_ context.Context, job *scaleset.JobCompleted) error {
 	s.logger.Info("job completed", "runner", job.RunnerName, "job", job.JobID, "result", job.Result)
 	return nil
 }
 
-// HandleDesiredRunnerCount boots a microVM per assigned job while the host
-// has room, and reports how many runners the host can take right now. Called at
-// least once per long poll, so it also notices VMs that powered off.
-func (s *scaler) HandleDesiredRunnerCount(ctx context.Context, assigned int) (int, error) {
-	var running, free []string
+// HandleDesiredRunnerCount records how many jobs GitHub assigned to this
+// scale set, boots microVMs for them while the host has room and reports how
+// many runners the scale set has. Called at least once per long poll, so it
+// also notices VMs that powered off.
+func (s *scaleSet) HandleDesiredRunnerCount(ctx context.Context, assigned int) (int, error) {
+	p := s.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s.assigned = assigned
+	return p.reconcile(ctx)[s], nil
+}
+
+// reconcile frees the slots whose VM powered off, boots VMs for the scale sets
+// with jobs still waiting, taking turns between them, and tells each scale set
+// how many runners it may take now. It returns how many runners each scale
+// set has. The caller holds p.mu.
+func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
+	running := map[*scaleSet]int{}
+	var free []string
 	var growth float64
-	for _, slot := range s.slots {
+	for _, slot := range p.slots {
 		used, ok := vmMemoryGiB(slot)
 		if ok {
-			delete(s.booting, slot)
-		} else if t, pending := s.booting[slot]; pending && time.Since(t) < 2*time.Minute {
+			delete(p.booting, slot)
+		} else if t, pending := p.booting[slot]; pending && time.Since(t) < 2*time.Minute {
 			ok = true
 		}
 		if ok {
-			running = append(running, slot)
-			growth += max(0, s.cfg.vmMemGiB-used)
+			running[p.owners[slot].set]++
+			growth += max(0, p.cfg.vmMemGiB-used)
 		} else {
-			delete(s.booting, slot)
-			s.forget(ctx, slot)
+			delete(p.booting, slot)
+			p.forget(ctx, slot)
 			free = append(free, slot)
-			os.Remove(filepath.Join(s.cfg.jitDir, slot, "jitconfig"))
+			os.Remove(filepath.Join(p.cfg.jitDir, slot, "jitconfig"))
 		}
 	}
 
-	room, reason := s.room(growth)
-	capacity := len(running) + min(room, len(free))
-	if reason != s.busyReason {
+	room, reason := p.room(growth)
+	if reason != p.busyReason {
 		if reason != "" {
-			s.logger.Warn("host busy, taking no new jobs", "reason", reason, "running", len(running))
+			p.logger.Warn("host busy, taking no new jobs", "reason", reason, "running", len(p.slots)-len(free))
 		} else {
-			s.logger.Info("host has room again", "running", len(running))
+			p.logger.Info("host has room again", "running", len(p.slots)-len(free))
 		}
-		s.busyReason = reason
+		p.busyReason = reason
 	}
-	if capacity != s.capacity {
-		s.logger.Info("capacity", "runners", capacity, "running", len(running), "assigned", assigned)
-		s.capacity = capacity
-	}
-	s.listener.SetMaxRunners(capacity)
 
-	for _, slot := range free {
-		if len(running) >= min(assigned, capacity) {
+	room = min(room, len(free))
+	for room > 0 {
+		var s *scaleSet
+		for i := range p.sets {
+			c := p.sets[(p.next+i)%len(p.sets)]
+			if running[c] < c.assigned {
+				s = c
+				p.next = (p.next + i + 1) % len(p.sets)
+				break
+			}
+		}
+		if s == nil {
 			break
 		}
-		if err := s.boot(ctx, slot); err != nil {
-			return len(running), err
+		slot := free[0]
+		if err := p.boot(ctx, s, slot); err != nil {
+			s.logger.Warn("booting runner", "slot", slot, "error", err)
+			break
 		}
-		running = append(running, slot)
+		free = free[1:]
+		running[s]++
+		room--
 	}
-	return len(running), nil
+
+	for _, s := range p.sets {
+		capacity := running[s] + room
+		if capacity != s.capacity {
+			s.logger.Info("capacity", "runners", capacity, "running", running[s], "assigned", s.assigned)
+			s.capacity = capacity
+		}
+		s.listener.SetMaxRunners(capacity)
+	}
+	return running
 }
 
-func (s *scaler) boot(ctx context.Context, slot string) error {
+func (p *pool) boot(ctx context.Context, s *scaleSet, slot string) error {
 	suffix := make([]byte, 4)
 	rand.Read(suffix)
 	name := slot + "-" + hex.EncodeToString(suffix)
@@ -237,16 +343,16 @@ func (s *scaler) boot(ctx context.Context, slot string) error {
 	jit, err := s.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{
 		Name:       name,
 		WorkFolder: "_work",
-	}, s.scaleSetID)
+	}, s.id)
 	if err != nil {
 		return fmt.Errorf("generating JIT config for %s: %w", name, err)
 	}
 
-	path := filepath.Join(s.cfg.jitDir, slot, "jitconfig")
+	path := filepath.Join(p.cfg.jitDir, slot, "jitconfig")
 	if err := os.WriteFile(path+".tmp", []byte(jit.EncodedJITConfig), 0o400); err != nil {
 		return err
 	}
-	if err := chown(path+".tmp", s.cfg.jitOwner); err != nil {
+	if err := chown(path+".tmp", p.cfg.jitOwner); err != nil {
 		return err
 	}
 	if err := os.Rename(path+".tmp", path); err != nil {
@@ -264,32 +370,30 @@ func (s *scaler) boot(ctx context.Context, slot string) error {
 	if out, err := exec.Command("systemctl", "start", "--no-block", unit).CombinedOutput(); err != nil {
 		return fmt.Errorf("starting %s: %w: %s", unit, err, out)
 	}
-	s.booting[slot] = time.Now()
-	s.runners[slot] = name
+	p.booting[slot] = time.Now()
+	p.owners[slot] = owner{set: s, runner: name}
 	s.logger.Info("booting runner", "slot", slot, "runner", name)
 	return nil
 }
 
-// vmMemoryGiB reports whether the slot's VM is running and how much memory
-// it holds so far.
 // forget removes the registration of a slot's last runner. GitHub drops a
 // runner once it finished its job, so this only matters for VMs that died
 // before taking one.
-func (s *scaler) forget(ctx context.Context, slot string) {
-	name, ok := s.runners[slot]
+func (p *pool) forget(ctx context.Context, slot string) {
+	o, ok := p.owners[slot]
 	if !ok {
 		return
 	}
-	delete(s.runners, slot)
-	runner, err := s.client.GetRunnerByName(ctx, name)
+	delete(p.owners, slot)
+	runner, err := o.set.client.GetRunnerByName(ctx, o.runner)
 	if err != nil || runner == nil {
 		return
 	}
-	if err := s.client.RemoveRunner(ctx, int64(runner.ID)); err != nil {
-		s.logger.Warn("removing unused runner", "runner", name, "error", err)
+	if err := o.set.client.RemoveRunner(ctx, int64(runner.ID)); err != nil {
+		o.set.logger.Warn("removing unused runner", "runner", o.runner, "error", err)
 		return
 	}
-	s.logger.Info("removed unused runner", "runner", name)
+	o.set.logger.Info("removed unused runner", "runner", o.runner)
 }
 
 func chown(path, owner string) error {
@@ -302,6 +406,8 @@ func chown(path, owner string) error {
 	return os.Chown(path, uid, gid)
 }
 
+// vmMemoryGiB reports whether the slot's VM is running and how much memory
+// it holds so far.
 func vmMemoryGiB(slot string) (float64, bool) {
 	out, _ := exec.Command("systemctl", "show", "--property=ActiveState,MemoryCurrent", "microvm@"+slot+".service").Output()
 	props := map[string]string{}
@@ -321,10 +427,10 @@ func vmMemoryGiB(slot string) (float64, bool) {
 
 // room returns how many more VMs fit, counting the memory running VMs may
 // still grow into, or 0 and why the host should take no new jobs.
-func (s *scaler) room(growth float64) (int, string) {
+func (p *pool) room(growth float64) (int, string) {
 	if raw, err := os.ReadFile("/proc/loadavg"); err == nil {
 		if load, err := strconv.ParseFloat(strings.Fields(string(raw))[0], 64); err == nil {
-			if perCPU := load / float64(runtime.NumCPU()); perCPU > s.cfg.maxLoadPerCPU {
+			if perCPU := load / float64(runtime.NumCPU()); perCPU > p.cfg.maxLoadPerCPU {
 				return 0, fmt.Sprintf("load %.2f per CPU", perCPU)
 			}
 		}
@@ -333,7 +439,7 @@ func (s *scaler) room(growth float64) (int, string) {
 	if err != nil {
 		return 0, err.Error()
 	}
-	n := int((avail - growth - s.cfg.memReserveGiB) / s.cfg.vmMemGiB)
+	n := int((avail - growth - p.cfg.memReserveGiB) / p.cfg.vmMemGiB)
 	if n <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB available, %.1f GiB promised to running VMs", avail, growth)
 	}
