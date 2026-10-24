@@ -181,21 +181,23 @@ in
         "network-online.target"
         "docker.service"
       ];
-      path =
-        (with pkgs; [
-          bash
-          config.nix.package
-          config.virtualisation.docker.package
-          coreutils
-          findutils
-          git
-          gnugrep
-          gnused
-          gnutar
-          gzip
-          sudo
-        ])
-        ++ cfg.packages;
+      # The setuid sudo; the one in the store is not.
+      path = [
+        "/run/wrappers"
+      ]
+      ++ (with pkgs; [
+        bash
+        config.nix.package
+        config.virtualisation.docker.package
+        coreutils
+        findutils
+        git
+        gnugrep
+        gnused
+        gnutar
+        gzip
+      ])
+      ++ cfg.packages;
       environment = {
         RUNNER_ROOT = "/var/lib/github-runner";
         inherit (config.environment.variables) NIX_REMOTE;
