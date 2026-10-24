@@ -46,6 +46,7 @@ type config struct {
 	maxLoadPerCPU  float64
 	vmMemGiB       float64
 	memReserveGiB  float64
+	memOvercommit  float64
 }
 
 func main() {
@@ -64,6 +65,7 @@ func main() {
 	flag.Float64Var(&c.maxLoadPerCPU, "max-load-per-cpu", 1.0, "take no new jobs above this 1-minute load average per CPU")
 	flag.Float64Var(&c.vmMemGiB, "vm-mem", 10, "memory of one microVM, in GiB")
 	flag.Float64Var(&c.memReserveGiB, "mem-reserve", 8, "memory to always leave for the host, in GiB")
+	flag.Float64Var(&c.memOvercommit, "mem-overcommit", 0, "how far the VMs' memory may exceed the host's, e.g. 0.3 for 30%")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -271,9 +273,8 @@ func (s *scaleSet) HandleDesiredRunnerCount(ctx context.Context, assigned int) (
 func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 	running := map[*scaleSet]int{}
 	var free []string
-	var growth float64
 	for _, slot := range p.slots {
-		used, ok := vmMemoryGiB(slot)
+		ok := vmRunning(slot)
 		if ok {
 			delete(p.booting, slot)
 		} else if t, pending := p.booting[slot]; pending && time.Since(t) < 2*time.Minute {
@@ -281,7 +282,6 @@ func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 		}
 		if ok {
 			running[p.owners[slot].set]++
-			growth += max(0, p.cfg.vmMemGiB-used)
 		} else {
 			delete(p.booting, slot)
 			p.forget(ctx, slot)
@@ -290,7 +290,7 @@ func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 		}
 	}
 
-	room, reason := p.room(growth)
+	room, reason := p.room(len(p.slots) - len(free))
 	if reason != p.busyReason {
 		if reason != "" {
 			p.logger.Warn("host busy, taking no new jobs", "reason", reason, "running", len(p.slots)-len(free))
@@ -406,28 +406,22 @@ func chown(path, owner string) error {
 	return os.Chown(path, uid, gid)
 }
 
-// vmMemoryGiB reports whether the slot's VM is running and how much memory
-// it holds so far.
-func vmMemoryGiB(slot string) (float64, bool) {
-	out, _ := exec.Command("systemctl", "show", "--property=ActiveState,MemoryCurrent", "microvm@"+slot+".service").Output()
-	props := map[string]string{}
-	for _, line := range strings.Split(string(out), "\n") {
-		if k, v, ok := strings.Cut(line, "="); ok {
-			props[k] = v
-		}
-	}
-	switch props["ActiveState"] {
+// vmRunning reports whether the slot's VM is running.
+func vmRunning(slot string) bool {
+	out, _ := exec.Command("systemctl", "show", "--property=ActiveState", "--value", "microvm@"+slot+".service").Output()
+	switch strings.TrimSpace(string(out)) {
 	case "active", "activating", "deactivating":
-	default:
-		return 0, false
+		return true
 	}
-	bytes, _ := strconv.ParseFloat(props["MemoryCurrent"], 64)
-	return bytes / (1 << 30), true
+	return false
 }
 
-// room returns how many more VMs fit, counting the memory running VMs may
-// still grow into, or 0 and why the host should take no new jobs.
-func (p *pool) room(growth float64) (int, string) {
+// room returns how many more VMs fit next to the running ones, or 0 and why
+// the host should take no new jobs. The VMs' memory may add up to more than
+// the host has, by memOvercommit: they rarely all use what they were given,
+// return what they free, and zram absorbs a peak. Memory that is actually in
+// use still has to leave room for one more VM.
+func (p *pool) room(running int) (int, string) {
 	if raw, err := os.ReadFile("/proc/loadavg"); err == nil {
 		if load, err := strconv.ParseFloat(strings.Fields(string(raw))[0], 64); err == nil {
 			if perCPU := load / float64(runtime.NumCPU()); perCPU > p.cfg.maxLoadPerCPU {
@@ -435,32 +429,39 @@ func (p *pool) room(growth float64) (int, string) {
 			}
 		}
 	}
-	avail, err := memAvailableGiB()
+	mem, err := meminfoGiB()
 	if err != nil {
 		return 0, err.Error()
 	}
-	n := int((avail - growth - p.cfg.memReserveGiB) / p.cfg.vmMemGiB)
+	usable := mem["MemTotal"] - p.cfg.memReserveGiB
+	given := float64(running) * p.cfg.vmMemGiB
+	n := int((usable*(1+p.cfg.memOvercommit) - given) / p.cfg.vmMemGiB)
 	if n <= 0 {
-		return 0, fmt.Sprintf("%.1f GiB available, %.1f GiB promised to running VMs", avail, growth)
+		return 0, fmt.Sprintf("%.1f GiB given to %d VMs, %.0f%% of the %.1f GiB usable", given, running, given/usable*100, usable)
+	}
+	if avail := mem["MemAvailable"] - p.cfg.memReserveGiB; avail < p.cfg.vmMemGiB {
+		return 0, fmt.Sprintf("%.1f GiB available", mem["MemAvailable"])
 	}
 	return n, ""
 }
 
-func memAvailableGiB() (float64, error) {
+// meminfoGiB returns the fields of /proc/meminfo, in GiB.
+func meminfoGiB() (map[string]float64, error) {
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer f.Close()
+	mem := map[string]float64{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && fields[0] == "MemAvailable:" {
-			kib, err := strconv.ParseFloat(fields[1], 64)
-			return kib / (1 << 20), err
+		if len(fields) >= 2 {
+			kib, _ := strconv.ParseFloat(fields[1], 64)
+			mem[strings.TrimSuffix(fields[0], ":")] = kib / (1 << 20)
 		}
 	}
-	return 0, errors.New("MemAvailable not found")
+	return mem, sc.Err()
 }
 
 // installationID finds the App's installation on org, so only the App ID and

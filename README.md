@@ -31,9 +31,15 @@ can take right now. All scale sets share one pool of VMs: an idle organization
 holds no slots, and when several have jobs waiting, free VMs go to them in
 turn. It boots one VM from the pool per assigned job, and grows only while:
 
-- the 1-minute load average per CPU is below `maxLoadPerCpu`, and
-- available memory still covers another VM after `memReserveGiB` and the
-  memory already-running VMs may still grow into.
+- the 1-minute load average per CPU is below `maxLoadPerCpu`,
+- the memory given to all VMs stays within the host's, less `memReserveGiB`,
+  plus `memOvercommit` (0.3 allows 130%), and
+- available memory still covers another VM after `memReserveGiB`.
+
+VMs hand the memory they free back to the host (free page reporting) and their
+disks bypass the host's page cache, so a VM only holds what its job uses.
+Overcommitting pairs well with zram on the host to absorb the rare moment
+when every VM peaks at once.
 
 When the host is busy it stops accepting jobs; they stay queued on GitHub
 instead of overloading the machine.
