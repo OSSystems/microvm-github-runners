@@ -118,12 +118,13 @@ in
     };
 
     # Nix talks to the host's daemon over vsock; the store itself is the
-    # host's, read-only.
+    # host's, read-only. The settings live in nix.conf rather than NIX_CONFIG,
+    # which jobs set for themselves and would replace them.
     nix.enable = false;
-    environment.variables = {
-      NIX_REMOTE = "daemon";
-      NIX_CONFIG = "experimental-features = nix-command flakes";
-    };
+    environment.variables.NIX_REMOTE = "daemon";
+    environment.etc."nix/nix.conf".text = ''
+      experimental-features = nix-command flakes
+    '';
     systemd.sockets.nix-daemon-proxy = {
       wantedBy = [ "sockets.target" ];
       socketConfig = {
@@ -191,7 +192,7 @@ in
         ++ cfg.packages;
       environment = {
         RUNNER_ROOT = "/var/lib/github-runner";
-        inherit (config.environment.variables) NIX_REMOTE NIX_CONFIG;
+        inherit (config.environment.variables) NIX_REMOTE;
       }
       // cfg.environment;
       unitConfig = {
