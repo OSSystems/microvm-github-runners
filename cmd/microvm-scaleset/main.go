@@ -165,7 +165,8 @@ type scaleSet struct {
 	listener *listener.Listener
 	// assigned is how many jobs GitHub last said this scale set has.
 	assigned int
-	capacity int
+	// waiting is how many of them had no VM at the last reconcile.
+	waiting int
 }
 
 func (p *pool) register(ctx context.Context, url string, key []byte) (*scaleSet, error) {
@@ -221,6 +222,10 @@ func (p *pool) register(ctx context.Context, url string, key []byte) (*scaleSet,
 	if err != nil {
 		return nil, err
 	}
+	// Every scale set accepts as many jobs as the pool has VMs, even while the
+	// host is busy: GitHub does not, in practice, offer a job again once it was offered to a
+	// scale set without room, so a job turned away would stay queued forever.
+	// Accepted jobs wait here instead until reconcile has room to boot them.
 	l, err := listener.New(session, listener.Config{
 		ScaleSetID: set.ID,
 		MaxRunners: len(p.slots),
@@ -266,10 +271,9 @@ func (s *scaleSet) HandleDesiredRunnerCount(ctx context.Context, assigned int) (
 	return p.reconcile(ctx)[s], nil
 }
 
-// reconcile frees the slots whose VM powered off, boots VMs for the scale sets
-// with jobs still waiting, taking turns between them, and tells each scale set
-// how many runners it may take now. It returns how many runners each scale
-// set has. The caller holds p.mu.
+// reconcile frees the slots whose VM powered off and boots VMs for the scale
+// sets with jobs still waiting, taking turns between them, while the host has
+// room. It returns how many runners each scale set has. The caller holds p.mu.
 func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 	running := map[*scaleSet]int{}
 	var free []string
@@ -291,14 +295,14 @@ func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 	}
 
 	room, reason := p.room(len(p.slots) - len(free))
-	if reason != p.busyReason {
+	if (reason != "") != (p.busyReason != "") {
 		if reason != "" {
-			p.logger.Warn("host busy, taking no new jobs", "reason", reason, "running", len(p.slots)-len(free))
+			p.logger.Warn("host busy, booting no new VMs", "reason", reason, "running", len(p.slots)-len(free))
 		} else {
 			p.logger.Info("host has room again", "running", len(p.slots)-len(free))
 		}
-		p.busyReason = reason
 	}
+	p.busyReason = reason
 
 	room = min(room, len(free))
 	for room > 0 {
@@ -325,12 +329,10 @@ func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 	}
 
 	for _, s := range p.sets {
-		capacity := running[s] + room
-		if capacity != s.capacity {
-			s.logger.Info("capacity", "runners", capacity, "running", running[s], "assigned", s.assigned)
-			s.capacity = capacity
+		if waiting := max(0, s.assigned-running[s]); waiting != s.waiting {
+			s.logger.Info("jobs waiting for a VM", "waiting", waiting, "running", running[s])
+			s.waiting = waiting
 		}
-		s.listener.SetMaxRunners(capacity)
 	}
 	return running
 }

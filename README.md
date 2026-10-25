@@ -41,7 +41,7 @@ disks bypass the host's page cache, so a VM only holds what its job uses.
 Overcommitting pairs well with zram on the host to absorb the rare moment
 when every VM peaks at once.
 
-When the host is busy it stops accepting jobs; they stay queued on GitHub
+When the host is busy it boots no new VMs; the jobs it accepted wait for one
 instead of overloading the machine.
 
 ## Usage
