@@ -435,16 +435,21 @@ func (p *pool) room(running int) (int, string) {
 	if err != nil {
 		return 0, err.Error()
 	}
+	return p.memoryRoom(running, mem)
+}
+
+func (p *pool) memoryRoom(running int, mem map[string]float64) (int, string) {
 	usable := mem["MemTotal"] - p.cfg.memReserveGiB
 	given := float64(running) * p.cfg.vmMemGiB
 	n := int((usable*(1+p.cfg.memOvercommit) - given) / p.cfg.vmMemGiB)
 	if n <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB given to %d VMs, %.0f%% of the %.1f GiB usable", given, running, given/usable*100, usable)
 	}
-	if avail := mem["MemAvailable"] - p.cfg.memReserveGiB; avail < p.cfg.vmMemGiB {
+	availableSlots := int((mem["MemAvailable"] - p.cfg.memReserveGiB) / p.cfg.vmMemGiB)
+	if availableSlots <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB available", mem["MemAvailable"])
 	}
-	return n, ""
+	return min(n, availableSlots), ""
 }
 
 // meminfoGiB returns the fields of /proc/meminfo, in GiB.
