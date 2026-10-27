@@ -66,6 +66,7 @@ in
     system.stateVersion = lib.mkDefault lib.trivial.release;
     # systemd picks up the JIT config from fw_cfg before the root is mounted.
     boot.initrd.kernelModules = [ "qemu_fw_cfg" ];
+    boot.kernelModules = [ "virtio_balloon" ];
     networking = {
       hostName = cfg.name;
       useDHCP = false;

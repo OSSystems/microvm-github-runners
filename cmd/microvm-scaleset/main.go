@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -35,43 +36,91 @@ import (
 )
 
 type config struct {
-	urls           []string
-	name           string
-	labels         string
-	appID          string
-	privateKeyFile string
-	slots          string
-	jitDir         string
-	jitOwner       string
-	maxLoadPerCPU  float64
-	vmMemGiB       float64
-	memReserveGiB  float64
-	memOvercommit  float64
+	urls               []string
+	name               string
+	labels             string
+	appID              string
+	privateKeyFile     string
+	slots              string
+	jitDir             string
+	jitOwner           string
+	maxLoadPerCPU      float64
+	vmMemGiB           float64
+	memReserveGiB      float64
+	memCommitRatio     float64
+	stateDir           string
+	statusFile         string
+	balloonEnabled     bool
+	balloonFloorGiB    float64
+	balloonHeadroomGiB float64
+	balloonSlot        string
+}
+
+func parseConfig(args []string) (config, error) {
+	var c config
+	f := flag.NewFlagSet("microvm-scaleset", flag.ContinueOnError)
+	f.Func("url", "organization URL; repeat to share the pool", func(v string) error { c.urls = append(c.urls, v); return nil })
+	f.StringVar(&c.name, "name", "", "scale set name in every organization")
+	f.StringVar(&c.labels, "labels", "", "comma-separated labels (defaults to the name)")
+	f.StringVar(&c.appID, "app-id", "", "GitHub App ID")
+	f.StringVar(&c.privateKeyFile, "private-key-file", "", "GitHub App private key")
+	f.StringVar(&c.slots, "slots", "", "comma-separated microVM slot names")
+	f.StringVar(&c.jitDir, "jit-dir", "/run/microvm-jit", "runner configuration and ownership directory")
+	f.StringVar(&c.jitOwner, "jit-owner", "microvm", "user the hypervisor reads JIT configs as")
+	f.StringVar(&c.stateDir, "state-dir", "/var/lib/microvms", "microvm.nix state directory")
+	f.StringVar(&c.statusFile, "status-file", "/run/microvm-scaleset/status.json", "memory and ownership status file")
+	f.Float64Var(&c.maxLoadPerCPU, "max-load-per-cpu", 1, "take no new jobs above this load per CPU")
+	f.Float64Var(&c.vmMemGiB, "vm-mem", 10, "boot memory ceiling per VM, GiB")
+	f.Float64Var(&c.memReserveGiB, "mem-reserve", 8, "host memory reserve, GiB")
+	f.Float64Var(&c.memCommitRatio, "mem-commit-ratio", 1, "nominal memory ceiling / usable host RAM; 2 means 200%")
+	var oldOvercommit float64
+	f.Float64Var(&oldOvercommit, "mem-overcommit", 0, "deprecated: extra memory fraction; use --mem-commit-ratio=1+fraction")
+	f.BoolVar(&c.balloonEnabled, "balloon-enable", false, "reclaim guest memory under host pressure")
+	f.Float64Var(&c.balloonFloorGiB, "balloon-floor", 8, "minimum balloon allocation, GiB")
+	f.Float64Var(&c.balloonHeadroomGiB, "balloon-headroom", 2, "available memory retained inside each guest, GiB")
+	f.StringVar(&c.balloonSlot, "balloon-slot", "", "restrict reclaim to this canary slot; empty selects all")
+	if err := f.Parse(args); err != nil {
+		return c, err
+	}
+	supplied := map[string]bool{}
+	f.Visit(func(v *flag.Flag) { supplied[v.Name] = true })
+	if supplied["mem-overcommit"] {
+		if supplied["mem-commit-ratio"] {
+			return c, errors.New("use only one of --mem-overcommit and --mem-commit-ratio")
+		}
+		c.memCommitRatio = 1 + oldOvercommit
+	}
+	for _, v := range []float64{c.maxLoadPerCPU, c.vmMemGiB, c.memCommitRatio, c.balloonFloorGiB, c.balloonHeadroomGiB} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			return c, errors.New("memory and load settings must be finite and positive")
+		}
+	}
+	if c.memCommitRatio < 1 || math.IsNaN(c.memReserveGiB) || math.IsInf(c.memReserveGiB, 0) || c.memReserveGiB < 0 {
+		return c, errors.New("commit ratio must be at least 1 and reserve must be nonnegative")
+	}
+	if c.balloonEnabled && c.balloonFloorGiB > c.vmMemGiB {
+		return c, errors.New("balloon floor exceeds VM boot memory")
+	}
+	for _, slot := range strings.Split(c.slots, ",") {
+		if slot != "" && (filepath.Base(slot) != slot || slot == "." || slot == ".." || strings.ContainsAny(slot, " \t\r\n")) {
+			return c, errors.New("invalid VM slot name")
+		}
+	}
+	return c, nil
 }
 
 func main() {
-	var c config
-	flag.Func("url", "organization URL, e.g. https://github.com/shellhub-io; repeat to share the pool between organizations", func(v string) error {
-		c.urls = append(c.urls, v)
-		return nil
-	})
-	flag.StringVar(&c.name, "name", "", "scale set name, the same in every organization")
-	flag.StringVar(&c.labels, "labels", "", "comma-separated labels (defaults to the name)")
-	flag.StringVar(&c.appID, "app-id", "", "GitHub App ID")
-	flag.StringVar(&c.privateKeyFile, "private-key-file", "", "GitHub App private key")
-	flag.StringVar(&c.slots, "slots", "", "comma-separated pool of microVM names to run jobs in")
-	flag.StringVar(&c.jitDir, "jit-dir", "/run/microvm-jit", "directory holding one JIT config per microVM")
-	flag.StringVar(&c.jitOwner, "jit-owner", "microvm", "user the hypervisor reads the JIT config as")
-	flag.Float64Var(&c.maxLoadPerCPU, "max-load-per-cpu", 1.0, "take no new jobs above this 1-minute load average per CPU")
-	flag.Float64Var(&c.vmMemGiB, "vm-mem", 10, "memory of one microVM, in GiB")
-	flag.Float64Var(&c.memReserveGiB, "mem-reserve", 8, "memory to always leave for the host, in GiB")
-	flag.Float64Var(&c.memOvercommit, "mem-overcommit", 0, "how far the VMs' memory may exceed the host's, e.g. 0.3 for 30%")
-	flag.Parse()
-
+	c, err := parseConfig(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
 	if err := run(ctx, logger, c); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("exiting", "error", err)
 		os.Exit(1)
@@ -82,6 +131,14 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 	if len(c.urls) == 0 {
 		return errors.New("no --url given")
 	}
+	lock, err := os.OpenFile(filepath.Join(c.jitDir, ".controller.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.New("another controller owns the VM pool")
+	}
 	key, err := os.ReadFile(c.privateKeyFile)
 	if err != nil {
 		return err
@@ -91,11 +148,13 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 	defer cancel(nil)
 
 	p := &pool{
-		cfg:     c,
-		logger:  logger,
-		slots:   strings.Split(c.slots, ","),
-		booting: map[string]time.Time{},
-		owners:  map[string]owner{},
+		cfg:        c,
+		logger:     logger,
+		slots:      strings.Split(c.slots, ","),
+		booting:    map[string]time.Time{},
+		owners:     map[string]owner{},
+		ownerRetry: map[string]time.Time{},
+		samples:    map[string]vmSample{},
 	}
 	for _, url := range c.urls {
 		s, err := p.register(ctx, url, key)
@@ -105,7 +164,14 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 		defer s.session.Close(context.WithoutCancel(ctx))
 	}
 
+	p.recoverOwners(ctx)
+	if mem, e := meminfoGiB(); e == nil {
+		capGiB := (mem["MemTotal"] - c.memReserveGiB) * c.memCommitRatio
+		logger.Info("nominal VM capacity", "capGiB", capGiB, "maximumVMs", int(capGiB/c.vmMemGiB), "poolSlots", len(p.slots))
+	}
+	logger.Info("memory policy", "bootGiB", c.vmMemGiB, "hostReserveGiB", c.memReserveGiB, "commitRatio", c.memCommitRatio, "poolSlots", len(p.slots), "balloonEnabled", c.balloonEnabled)
 	var wg sync.WaitGroup
+	wg.Go(func() { p.telemetryLoop(ctx) })
 	for _, s := range p.sets {
 		wg.Go(func() {
 			cancel(fmt.Errorf("%s: %w", s.org, s.listener.Run(ctx, s)))
@@ -144,7 +210,11 @@ type pool struct {
 	booting map[string]time.Time
 	// owners maps each slot to the scale set and runner it was last booted
 	// with.
-	owners map[string]owner
+	owners     map[string]owner
+	ownerRetry map[string]time.Time
+	memoryMu   sync.Mutex
+	controlMu  sync.Mutex
+	samples    map[string]vmSample
 	// next is the scale set that gets the next free slot, so a busy
 	// organization cannot starve the others.
 	next int
@@ -153,13 +223,21 @@ type pool struct {
 type owner struct {
 	set    *scaleSet
 	runner string
+	record ownerRecord
+	source string
+}
+
+type runnerClient interface {
+	GenerateJitRunnerConfig(context.Context, *scaleset.RunnerScaleSetJitRunnerSetting, int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+	GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error)
+	RemoveRunner(context.Context, int64) error
 }
 
 type scaleSet struct {
 	pool     *pool
 	org      string
 	logger   *slog.Logger
-	client   *scaleset.Client
+	client   runnerClient
 	id       int
 	session  *scaleset.MessageSessionClient
 	listener *listener.Listener
@@ -277,24 +355,49 @@ func (s *scaleSet) HandleDesiredRunnerCount(ctx context.Context, assigned int) (
 func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 	running := map[*scaleSet]int{}
 	var free []string
+	unknown := 0
 	for _, slot := range p.slots {
-		ok := vmRunning(slot)
-		if ok {
-			delete(p.booting, slot)
-		} else if t, pending := p.booting[slot]; pending && time.Since(t) < 2*time.Minute {
-			ok = true
+		active := vmRunning(slot)
+		if _, ok := p.owners[slot]; !ok && time.Now().After(p.ownerRetry[slot]) {
+			if err := p.restoreOwner(ctx, slot, active); err != nil {
+				p.logger.Warn("runner ownership unresolved", "slot", slot, "error", err)
+				if p.ownerRetry == nil {
+					p.ownerRetry = map[string]time.Time{}
+				}
+				p.ownerRetry[slot] = time.Now().Add(time.Minute)
+			}
 		}
-		if ok {
-			running[p.owners[slot].set]++
-		} else {
+		occupied := active
+		if active {
 			delete(p.booting, slot)
-			p.forget(ctx, slot)
-			free = append(free, slot)
-			os.Remove(filepath.Join(p.cfg.jitDir, slot, "jitconfig"))
+		} else if t, ok := p.booting[slot]; ok && time.Since(t) < bootGrace {
+			occupied = true
 		}
+		if occupied {
+			if o, ok := p.owners[slot]; ok {
+				running[o.set]++
+			} else {
+				unknown++
+			}
+			continue
+		}
+		delete(p.booting, slot)
+		if !p.forget(ctx, slot) {
+			if o, ok := p.owners[slot]; ok {
+				running[o.set]++
+			} else {
+				unknown++
+			}
+			continue
+		}
+		delete(p.ownerRetry, slot)
+		free = append(free, slot)
 	}
-
 	room, reason := p.room(len(p.slots) - len(free))
+	if unknown > 0 {
+		room = 0
+		reason = fmt.Sprintf("%d active slots have unknown owners", unknown)
+	}
 	if (reason != "") != (p.busyReason != "") {
 		if reason != "" {
 			p.logger.Warn("host busy, booting no new VMs", "reason", reason, "running", len(p.slots)-len(free))
@@ -303,37 +406,38 @@ func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 		}
 	}
 	p.busyReason = reason
-
 	room = min(room, len(free))
 	for room > 0 {
-		var s *scaleSet
+		var set *scaleSet
 		for i := range p.sets {
-			c := p.sets[(p.next+i)%len(p.sets)]
-			if running[c] < c.assigned {
-				s = c
+			candidate := p.sets[(p.next+i)%len(p.sets)]
+			if running[candidate] < candidate.assigned {
+				set = candidate
 				p.next = (p.next + i + 1) % len(p.sets)
 				break
 			}
 		}
-		if s == nil {
+		if set == nil {
 			break
 		}
 		slot := free[0]
-		if err := p.boot(ctx, s, slot); err != nil {
-			s.logger.Warn("booting runner", "slot", slot, "error", err)
+		if err := p.boot(ctx, set, slot); err != nil {
+			set.logger.Warn("booting runner", "slot", slot, "error", err)
 			break
 		}
 		free = free[1:]
-		running[s]++
-		room--
+		running[set]++
+		// Reserve newly requested memory before admitting another boot.
+		room, _ = p.room(len(p.slots) - len(free))
+		room = min(room, len(free))
 	}
-
-	for _, s := range p.sets {
-		if waiting := max(0, s.assigned-running[s]); waiting != s.waiting {
-			s.logger.Info("jobs waiting for a VM", "waiting", waiting, "running", running[s])
-			s.waiting = waiting
+	for _, set := range p.sets {
+		if waiting := max(0, set.assigned-running[set]); waiting != set.waiting {
+			set.logger.Info("jobs waiting for a VM", "waiting", waiting, "running", running[set])
+			set.waiting = waiting
 		}
 	}
+	p.writeStatus(running, unknown)
 	return running
 }
 
@@ -342,6 +446,12 @@ func (p *pool) boot(ctx context.Context, s *scaleSet, slot string) error {
 	rand.Read(suffix)
 	name := slot + "-" + hex.EncodeToString(suffix)
 
+	record := ownerRecord{Version: 1, Org: s.org, ScaleSetID: s.id, Runner: name, StartedAt: time.Now(), MemoryGiB: p.cfg.vmMemGiB}
+	if err := p.writeOwner(slot, record); err != nil {
+		return err
+	}
+	p.owners[slot] = owner{set: s, runner: name, record: record, source: "boot"}
+	p.booting[slot] = record.StartedAt
 	jit, err := s.client.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{
 		Name:       name,
 		WorkFolder: "_work",
@@ -373,7 +483,7 @@ func (p *pool) boot(ctx context.Context, s *scaleSet, slot string) error {
 		return fmt.Errorf("starting %s: %w: %s", unit, err, out)
 	}
 	p.booting[slot] = time.Now()
-	p.owners[slot] = owner{set: s, runner: name}
+	p.owners[slot] = owner{set: s, runner: name, record: record, source: "boot"}
 	s.logger.Info("booting runner", "slot", slot, "runner", name)
 	return nil
 }
@@ -381,21 +491,39 @@ func (p *pool) boot(ctx context.Context, s *scaleSet, slot string) error {
 // forget removes the registration of a slot's last runner. GitHub drops a
 // runner once it finished its job, so this only matters for VMs that died
 // before taking one.
-func (p *pool) forget(ctx context.Context, slot string) {
-	o, ok := p.owners[slot]
-	if !ok {
-		return
+func (p *pool) forget(ctx context.Context, slot string) bool {
+	if o, ok := p.owners[slot]; ok {
+		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		runner, err := o.set.client.GetRunnerByName(lookupCtx, o.runner)
+		if err != nil {
+			p.logger.Warn("runner cleanup deferred", "slot", slot, "error", err)
+			return false
+		}
+		if runner != nil {
+			if err := o.set.client.RemoveRunner(lookupCtx, int64(runner.ID)); err != nil {
+				p.logger.Warn("runner cleanup deferred", "slot", slot, "error", err)
+				return false
+			}
+		}
+	}
+	for _, name := range []string{"jitconfig", "owner.json"} {
+		if err := os.Remove(filepath.Join(p.cfg.jitDir, slot, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			p.logger.Warn("slot cleanup deferred", "slot", slot, "error", err)
+			return false
+		}
+	}
+	if o, ok := p.owners[slot]; ok {
+		sample := p.memorySnapshot()[slot]
+		if sample.Runner == o.runner {
+			p.logger.Info("runner memory summary", "slot", slot, "org", o.set.org, "runner", o.runner, "observations", sample.Observations, "peakGuestUsedGiB", float64(sample.PeakUsedBytes)/float64(gib), "peakResidentGiB", float64(sample.PeakResidentBytes)/float64(gib), "oomKills", sample.Guest.OOMKills)
+		}
 	}
 	delete(p.owners, slot)
-	runner, err := o.set.client.GetRunnerByName(ctx, o.runner)
-	if err != nil || runner == nil {
-		return
-	}
-	if err := o.set.client.RemoveRunner(ctx, int64(runner.ID)); err != nil {
-		o.set.logger.Warn("removing unused runner", "runner", o.runner, "error", err)
-		return
-	}
-	o.set.logger.Info("removed unused runner", "runner", o.runner)
+	p.memoryMu.Lock()
+	delete(p.samples, slot)
+	p.memoryMu.Unlock()
+	return true
 }
 
 func chown(path, owner string) error {
@@ -410,12 +538,22 @@ func chown(path, owner string) error {
 
 // vmRunning reports whether the slot's VM is running.
 func vmRunning(slot string) bool {
-	out, _ := exec.Command("systemctl", "show", "--property=ActiveState", "--value", "microvm@"+slot+".service").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", "microvm@"+slot+".service").Output()
+	if err != nil {
+		return true
+	}
 	switch strings.TrimSpace(string(out)) {
 	case "active", "activating", "deactivating":
 		return true
 	}
-	return false
+	job, err := exec.CommandContext(ctx, "systemctl", "show", "--property=Job", "--value", "microvm@"+slot+".service").Output()
+	if err != nil {
+		return true
+	}
+	value := strings.TrimSpace(string(job))
+	return value != "" && value != "0" && value != "[0 /]"
 }
 
 // room returns how many more VMs fit next to the running ones, or 0 and why
@@ -441,13 +579,24 @@ func (p *pool) room(running int) (int, string) {
 func (p *pool) memoryRoom(running int, mem map[string]float64) (int, string) {
 	usable := mem["MemTotal"] - p.cfg.memReserveGiB
 	given := float64(running) * p.cfg.vmMemGiB
-	n := int((usable*(1+p.cfg.memOvercommit) - given) / p.cfg.vmMemGiB)
+	if len(p.owners) > 0 {
+		given = 0
+		for _, o := range p.owners {
+			given += o.record.MemoryGiB
+		}
+		given += float64(max(0, running-len(p.owners))) * p.cfg.vmMemGiB
+	}
+	n := int((usable*p.cfg.memCommitRatio - given) / p.cfg.vmMemGiB)
 	if n <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB given to %d VMs, %.0f%% of the %.1f GiB usable", given, running, given/usable*100, usable)
 	}
-	availableSlots := int((mem["MemAvailable"] - p.cfg.memReserveGiB) / p.cfg.vmMemGiB)
+	growth, emergency := p.growthReservation(time.Now())
+	if emergency {
+		return 0, "guest memory emergency; awaiting safe growth"
+	}
+	availableSlots := int((mem["MemAvailable"] - p.cfg.memReserveGiB - growth) / p.cfg.vmMemGiB)
 	if availableSlots <= 0 {
-		return 0, fmt.Sprintf("%.1f GiB available", mem["MemAvailable"])
+		return 0, fmt.Sprintf("%.1f GiB available, %.1f GiB reserved for VM growth", mem["MemAvailable"], growth)
 	}
 	return min(n, availableSlots), ""
 }
