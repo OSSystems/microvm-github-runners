@@ -180,3 +180,13 @@ case "$*" in *ActiveState*) echo inactive;; *Job*) echo 2048;; *) exit 1;; esac
 		t.Fatal("queued systemd start was treated as a free slot")
 	}
 }
+
+func TestBalloonDoesNotChurnAtPressureBoundary(t *testing.T) {
+	now := time.Now()
+	c := config{vmMemGiB: 10, memReserveGiB: 8, balloonEnabled: true, balloonFloorGiB: 8, balloonHeadroomGiB: 2}
+	r := ownerRecord{StartedAt: now.Add(-time.Hour)}
+	s := vmSample{ObservedAt: now, FreshSamples: 4, Guest: guestMemory{ActualBytes: 9 * gib, CeilingBytes: 10 * gib, AvailableBytes: 6 * gib, OOMKills: 0, UpdatedAt: now.Unix()}}
+	if got := balloonTarget(c, r, s, 18.25, true, now); got != 9*gib {
+		t.Fatalf("boundary caused growth to %.2f GiB, want steady 9 GiB", float64(got)/float64(gib))
+	}
+}

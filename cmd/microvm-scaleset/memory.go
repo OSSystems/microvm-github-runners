@@ -202,10 +202,14 @@ func balloonTarget(c config, r ownerRecord, s vmSample, hostAvailable float64, w
 	floor := min(ceiling, int64(c.balloonFloorGiB*float64(gib)))
 	pressure := hostAvailable < c.memReserveGiB+c.vmMemGiB && (waiting || hostAvailable < c.memReserveGiB)
 	target := actual
-	if !c.balloonEnabled || s.Pinned || !pressure {
+	if !c.balloonEnabled || s.Pinned {
 		target = ceiling
 	} else if s.Guest.AvailableBytes < headroom {
 		target = min(ceiling, actual+2*headroom-s.Guest.AvailableBytes)
+	} else if !pressure {
+		if !waiting || hostAvailable >= c.memReserveGiB+c.vmMemGiB+c.balloonHeadroomGiB {
+			target = ceiling
+		}
 	} else if now.Sub(r.StartedAt) >= 90*time.Second && s.FreshSamples >= 3 && now.Sub(s.ResizedAt) >= 30*time.Second && s.Guest.UpdatedAt > s.ResizedAt.Unix()+5 {
 		target = max(floor, min(ceiling, actual-s.Guest.AvailableBytes+headroom))
 		target = max(target, actual-(256<<20))
