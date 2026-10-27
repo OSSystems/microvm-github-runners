@@ -231,3 +231,13 @@ func TestElasticGuestDoesNotExpandJustBecauseHostIsIdle(t *testing.T) {
 		t.Fatalf("growth=%v urgent=%v, want 3 GiB of allocated but unfaulted RAM", growth, urgent)
 	}
 }
+
+func TestBalloonWaitsForStatsAfterResize(t *testing.T) {
+	now := time.Now()
+	c := config{vmMemGiB: 16, vmInitialMemGiB: 2, memReserveGiB: 8, balloonEnabled: true, balloonFloorGiB: 2, balloonHeadroomGiB: 1}
+	r := ownerRecord{MemoryGiB: 16, InitialMemoryGiB: 2, StartedAt: now.Add(-time.Hour)}
+	s := vmSample{ObservedAt: now, ResizedAt: now.Add(-time.Second), Guest: guestMemory{ActualBytes: 3 * gib, CeilingBytes: 16 * gib, AvailableBytes: gib / 2, UpdatedAt: now.Add(-2 * time.Second).Unix(), OOMKills: 0}}
+	if got := balloonTarget(c, r, s, 40, true, now); got != 3*gib {
+		t.Fatalf("reused pre-resize stats to grant %d bytes", got)
+	}
+}

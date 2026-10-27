@@ -201,6 +201,9 @@ func balloonTarget(c config, r ownerRecord, s vmSample, hostAvailable float64, w
 	if s.Error != "" || !s.Guest.fresh(now) || s.ObservedAt.After(now) || now.Sub(s.ObservedAt) > 15*time.Second {
 		return actual
 	}
+	if !s.ResizedAt.IsZero() && s.Guest.UpdatedAt <= s.ResizedAt.Unix() {
+		return actual
+	}
 	ceiling := s.Guest.CeilingBytes
 	headroom := int64(c.balloonHeadroomGiB * float64(gib))
 	floor := min(ceiling, int64(c.balloonFloorGiB*float64(gib)))
