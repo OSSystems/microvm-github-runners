@@ -128,6 +128,10 @@ func (p *pool) sampleSlot(ctx context.Context, slot string, o owner, waiting boo
 	if err != nil || unit.State != "active" || unit.Invocation == "" {
 		return
 	}
+	ready, initErr := p.initializeMemory(ctx, slot, o, unit)
+	if initErr != nil || !ready {
+		return
+	}
 	sample := vmSample{Runner: o.runner, Invocation: unit.Invocation, ObservedAt: time.Now(), RAMBytes: -1, ResidentBytes: -1, SwapBytes: -1}
 	if strings.HasPrefix(unit.Cgroup, "/") && !strings.Contains(unit.Cgroup, "..") {
 		base := filepath.Join("/sys/fs/cgroup", unit.Cgroup)
@@ -197,17 +201,25 @@ func balloonTarget(c config, r ownerRecord, s vmSample, hostAvailable float64, w
 	if s.Error != "" || !s.Guest.fresh(now) || s.ObservedAt.After(now) || now.Sub(s.ObservedAt) > 15*time.Second {
 		return actual
 	}
+	if !s.ResizedAt.IsZero() && s.Guest.UpdatedAt <= s.ResizedAt.Unix() {
+		return actual
+	}
 	ceiling := s.Guest.CeilingBytes
 	headroom := int64(c.balloonHeadroomGiB * float64(gib))
 	floor := min(ceiling, int64(c.balloonFloorGiB*float64(gib)))
-	pressure := hostAvailable < c.memReserveGiB+c.vmMemGiB && (waiting || hostAvailable < c.memReserveGiB)
+	bootMemory := c.vmInitialMemGiB
+	if bootMemory <= 0 {
+		bootMemory = c.vmMemGiB
+	}
+	elastic := r.InitialMemoryGiB > 0 && r.InitialMemoryGiB < r.MemoryGiB
+	pressure := hostAvailable < c.memReserveGiB+bootMemory && (waiting || hostAvailable < c.memReserveGiB)
 	target := actual
 	if !c.balloonEnabled || s.Pinned {
 		target = ceiling
 	} else if s.Guest.AvailableBytes < headroom {
 		target = min(ceiling, actual+2*headroom-s.Guest.AvailableBytes)
 	} else if !pressure {
-		if !waiting || hostAvailable >= c.memReserveGiB+c.vmMemGiB+c.balloonHeadroomGiB {
+		if !elastic && (!waiting || hostAvailable >= c.memReserveGiB+bootMemory+c.balloonHeadroomGiB) {
 			target = ceiling
 		}
 	} else if now.Sub(r.StartedAt) >= 90*time.Second && s.FreshSamples >= 3 && now.Sub(s.ResizedAt) >= 30*time.Second && s.Guest.UpdatedAt > s.ResizedAt.Unix()+5 {
@@ -216,7 +228,11 @@ func balloonTarget(c config, r ownerRecord, s vmSample, hostAvailable float64, w
 	}
 	if target > actual {
 		budget := int64(max(0, hostAvailable-c.memReserveGiB) * float64(gib))
-		target = min(target, actual+min(int64(512<<20), budget))
+		step := int64(512 << 20)
+		if elastic {
+			step = 2 * gib
+		}
+		target = min(target, actual+min(step, budget))
 		target = target / (1 << 20) * (1 << 20)
 	} else if target < actual {
 		target = (target + (1 << 20) - 1) / (1 << 20) * (1 << 20)
@@ -252,6 +268,10 @@ func (p *pool) controlMemory(ctx context.Context, slot string, o owner, s vmSamp
 		return
 	}
 	available := mem["MemAvailable"] - otherGrowth
+	if o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < o.record.MemoryGiB {
+		ownGrowth, _ := slotGrowthReservation(p.cfg, o, s, time.Now())
+		available -= ownGrowth
+	}
 	policy := p.cfg
 	if policy.balloonSlot != "" && policy.balloonSlot != slot {
 		policy.balloonEnabled = false
@@ -300,7 +320,15 @@ func (p *pool) controlMemory(ctx context.Context, slot string, o owner, s vmSamp
 
 func slotGrowthReservation(c config, o owner, s vmSample, now time.Time) (float64, bool) {
 	ceiling := o.record.MemoryGiB
+	elastic := o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < ceiling
 	fresh := s.Runner == o.runner && s.Error == "" && s.Guest.fresh(now) && now.Sub(s.ObservedAt) <= 15*time.Second
+	if elastic {
+		if !fresh {
+			return o.record.InitialMemoryGiB, true
+		}
+		allocated := max(s.Guest.ActualBytes, s.TargetBytes)
+		return float64(max(int64(0), allocated-max(int64(0), s.RAMBytes))) / float64(gib), s.Pinned && s.Guest.AvailableBytes < int64(c.balloonHeadroomGiB*float64(gib))
+	}
 	if !fresh || now.Sub(o.record.StartedAt) < bootGrace {
 		resident := 0.0
 		if fresh && s.RAMBytes >= 0 {
@@ -319,6 +347,10 @@ func (p *pool) growthReservation(now time.Time) (float64, bool) {
 	reserve := 0.0
 	emergency := false
 	for slot, o := range p.owners {
+		if o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < o.record.MemoryGiB && !p.initialMemoryReady(slot, o.runner) {
+			reserve += o.record.InitialMemoryGiB
+			continue
+		}
 		growth, urgent := slotGrowthReservation(p.cfg, o, samples[slot], now)
 		reserve += growth
 		emergency = emergency || urgent
@@ -362,7 +394,7 @@ func (p *pool) writeStatus(running map[*scaleSet]int, unknown int) {
 			r := o.record
 			entry.Owner = &r
 			entry.Source = o.source
-			status.NominalGiB += r.MemoryGiB
+			status.NominalGiB += committedMemoryGiB(o, samples[slot])
 		}
 		if sample, ok := samples[slot]; ok && time.Since(sample.ObservedAt) < 15*time.Second && ((entry.Owner != nil && sample.Runner == entry.Owner.Runner) || (entry.Owner == nil && sample.Runner == "")) {
 			entry.Memory = &sample
@@ -379,4 +411,14 @@ func (p *pool) writeStatus(running map[*scaleSet]int, unknown int) {
 	if err != nil {
 		p.logger.Warn("writing pool status", "error", fmt.Sprint(err))
 	}
+}
+
+func committedMemoryGiB(o owner, s vmSample) float64 {
+	if o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < o.record.MemoryGiB {
+		if s.Runner == o.runner && s.Guest.ActualBytes > 0 {
+			return float64(max(s.Guest.ActualBytes, s.TargetBytes)) / float64(gib)
+		}
+		return o.record.InitialMemoryGiB
+	}
+	return o.record.MemoryGiB
 }

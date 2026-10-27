@@ -46,6 +46,7 @@ type config struct {
 	jitOwner           string
 	maxLoadPerCPU      float64
 	vmMemGiB           float64
+	vmInitialMemGiB    float64
 	memReserveGiB      float64
 	memCommitRatio     float64
 	stateDir           string
@@ -71,6 +72,7 @@ func parseConfig(args []string) (config, error) {
 	f.StringVar(&c.statusFile, "status-file", "/run/microvm-scaleset/status.json", "memory and ownership status file")
 	f.Float64Var(&c.maxLoadPerCPU, "max-load-per-cpu", 1, "take no new jobs above this load per CPU")
 	f.Float64Var(&c.vmMemGiB, "vm-mem", 10, "boot memory ceiling per VM, GiB")
+	f.Float64Var(&c.vmInitialMemGiB, "vm-initial-mem", 0, "initial guest allocation, GiB; zero defaults to ceiling")
 	f.Float64Var(&c.memReserveGiB, "mem-reserve", 8, "host memory reserve, GiB")
 	f.Float64Var(&c.memCommitRatio, "mem-commit-ratio", 1, "nominal memory ceiling / usable host RAM; 2 means 200%")
 	var oldOvercommit float64
@@ -90,7 +92,10 @@ func parseConfig(args []string) (config, error) {
 		}
 		c.memCommitRatio = 1 + oldOvercommit
 	}
-	for _, v := range []float64{c.maxLoadPerCPU, c.vmMemGiB, c.memCommitRatio, c.balloonFloorGiB, c.balloonHeadroomGiB} {
+	if !supplied["vm-initial-mem"] {
+		c.vmInitialMemGiB = c.vmMemGiB
+	}
+	for _, v := range []float64{c.vmInitialMemGiB, c.maxLoadPerCPU, c.vmMemGiB, c.memCommitRatio, c.balloonFloorGiB, c.balloonHeadroomGiB} {
 		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
 			return c, errors.New("memory and load settings must be finite and positive")
 		}
@@ -98,7 +103,10 @@ func parseConfig(args []string) (config, error) {
 	if c.memCommitRatio < 1 || math.IsNaN(c.memReserveGiB) || math.IsInf(c.memReserveGiB, 0) || c.memReserveGiB < 0 {
 		return c, errors.New("commit ratio must be at least 1 and reserve must be nonnegative")
 	}
-	if c.balloonEnabled && c.balloonFloorGiB > c.vmMemGiB {
+	if c.vmInitialMemGiB > c.vmMemGiB {
+		return c, errors.New("initial memory exceeds VM ceiling")
+	}
+	if c.balloonEnabled && c.balloonFloorGiB > c.vmInitialMemGiB {
 		return c, errors.New("balloon floor exceeds VM boot memory")
 	}
 	for _, slot := range strings.Split(c.slots, ",") {
@@ -167,9 +175,9 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 	p.recoverOwners(ctx)
 	if mem, e := meminfoGiB(); e == nil {
 		capGiB := (mem["MemTotal"] - c.memReserveGiB) * c.memCommitRatio
-		logger.Info("nominal VM capacity", "capGiB", capGiB, "maximumVMs", int(capGiB/c.vmMemGiB), "poolSlots", len(p.slots))
+		logger.Info("nominal VM capacity", "capGiB", capGiB, "maximumVMs", min(len(p.slots), int(capGiB/c.vmInitialMemGiB)), "poolSlots", len(p.slots))
 	}
-	logger.Info("memory policy", "bootGiB", c.vmMemGiB, "hostReserveGiB", c.memReserveGiB, "commitRatio", c.memCommitRatio, "poolSlots", len(p.slots), "balloonEnabled", c.balloonEnabled)
+	logger.Info("memory policy", "ceilingGiB", c.vmMemGiB, "initialGiB", c.vmInitialMemGiB, "hostReserveGiB", c.memReserveGiB, "commitRatio", c.memCommitRatio, "poolSlots", len(p.slots), "balloonEnabled", c.balloonEnabled)
 	var wg sync.WaitGroup
 	wg.Go(func() { p.telemetryLoop(ctx) })
 	for _, s := range p.sets {
@@ -448,7 +456,7 @@ func (p *pool) boot(ctx context.Context, s *scaleSet, slot string) error {
 	rand.Read(suffix)
 	name := slot + "-" + hex.EncodeToString(suffix)
 
-	record := ownerRecord{Version: 1, Org: s.org, ScaleSetID: s.id, Runner: name, StartedAt: time.Now(), MemoryGiB: p.cfg.vmMemGiB}
+	record := ownerRecord{Version: 1, Org: s.org, ScaleSetID: s.id, Runner: name, StartedAt: time.Now(), MemoryGiB: p.cfg.vmMemGiB, InitialMemoryGiB: p.cfg.vmInitialMemGiB}
 	if err := p.writeOwner(slot, record); err != nil {
 		return err
 	}
@@ -473,6 +481,9 @@ func (p *pool) boot(ctx context.Context, s *scaleSet, slot string) error {
 		return err
 	}
 
+	if err := os.Remove(filepath.Join(p.cfg.jitDir, slot, "control", "ready")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	unit := "microvm@" + slot + ".service"
 	exec.Command("systemctl", "reset-failed", unit).Run()
 	// virtiofsd exits with the previous VM and its supervisor does not bring
@@ -583,12 +594,17 @@ func (p *pool) memoryRoom(running int, mem map[string]float64) (int, string) {
 	given := float64(running) * p.cfg.vmMemGiB
 	if len(p.owners) > 0 {
 		given = 0
-		for _, o := range p.owners {
-			given += o.record.MemoryGiB
+		samples := p.memorySnapshot()
+		for slot, o := range p.owners {
+			given += committedMemoryGiB(o, samples[slot])
 		}
 		given += float64(max(0, running-len(p.owners))) * p.cfg.vmMemGiB
 	}
-	n := int((usable*p.cfg.memCommitRatio - given) / p.cfg.vmMemGiB)
+	initial := p.cfg.vmInitialMemGiB
+	if initial <= 0 {
+		initial = p.cfg.vmMemGiB
+	}
+	n := int((usable*p.cfg.memCommitRatio - given) / initial)
 	if n <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB given to %d VMs, %.0f%% of the %.1f GiB usable", given, running, given/usable*100, usable)
 	}
@@ -596,7 +612,7 @@ func (p *pool) memoryRoom(running int, mem map[string]float64) (int, string) {
 	if emergency {
 		return 0, "guest memory emergency; awaiting safe growth"
 	}
-	availableSlots := int((mem["MemAvailable"] - p.cfg.memReserveGiB - growth) / p.cfg.vmMemGiB)
+	availableSlots := int((mem["MemAvailable"] - p.cfg.memReserveGiB - growth) / initial)
 	if availableSlots <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB available, %.1f GiB reserved for VM growth", mem["MemAvailable"], growth)
 	}

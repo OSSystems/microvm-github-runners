@@ -32,7 +32,7 @@ holds no slots, and when several have jobs waiting, free VMs go to them in
 turn. It boots one VM from the pool per assigned job, and grows only while:
 
 - the 1-minute load average per CPU is below `maxLoadPerCpu`,
-- total boot memory stays within `(host RAM - memReserveGiB) * memCommitRatio`, and
+- committed allocations stay within `(host RAM - memReserveGiB) * memCommitRatio`, and
 - available host memory covers another VM, the host reserve, and reserved VM growth.
 
 `memCommitRatio = 1.0` permits 100% of usable host RAM; `2.0` permits 200%.
@@ -46,6 +46,15 @@ Optional balloon reclamation releases that cache under pressure while keeping
 one shared pool for light and heavy jobs. It keeps each VM between
 `balloon.floorGiB` and its original boot ceiling, `vm.memGiB`, with
 `balloon.headroomGiB` available inside the guest.
+
+Set `vm.initialMemGiB` below `vm.memGiB` to start smaller. The guest runner
+waits until the controller confirms that initial allocation through QMP.
+Each unready start reserves its initial allocation, and its ready marker is
+cleared before reuse. Parallel starts remain subject to the host budget.
+Admission budgets committed allocations and RAM already granted but not yet
+resident, rather than reserving every guest’s full ceiling. Established elastic
+guests grow on guest pressure instead of expanding merely because the host is idle.
+The ceiling is a limit, not a promise that every guest can reach it simultaneously.
 
 Reclamation requires fresh guest statistics, waits 90 seconds after boot,
 and shrinks by at most 256 MiB every 30 seconds. Growth also requires host
