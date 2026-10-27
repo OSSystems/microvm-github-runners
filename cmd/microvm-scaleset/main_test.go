@@ -211,8 +211,8 @@ func TestElasticAdmissionBudgetsAllocationInsteadOfCeiling(t *testing.T) {
 		t.Fatalf("room=%d (%s), want 8 additional starts", n, reason)
 	}
 	os.Remove(filepath.Join(p.cfg.jitDir, "slot-0", "control", "ready"))
-	if n, _ := p.memoryRoom(6, map[string]float64{"MemTotal": 64, "MemAvailable": 40}); n != 0 {
-		t.Fatal("admitted another startup before initial allocation confirmed")
+	if n, reason := p.memoryRoom(6, map[string]float64{"MemTotal": 64, "MemAvailable": 40}); n != 7 {
+		t.Fatalf("parallel startup room=%d (%s), want 7 with 4 GiB pending reservation", n, reason)
 	}
 }
 

@@ -347,6 +347,10 @@ func (p *pool) growthReservation(now time.Time) (float64, bool) {
 	reserve := 0.0
 	emergency := false
 	for slot, o := range p.owners {
+		if o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < o.record.MemoryGiB && !p.initialMemoryReady(slot, o.runner) {
+			reserve += o.record.InitialMemoryGiB
+			continue
+		}
 		growth, urgent := slotGrowthReservation(p.cfg, o, samples[slot], now)
 		reserve += growth
 		emergency = emergency || urgent

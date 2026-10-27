@@ -49,7 +49,8 @@ one shared pool for light and heavy jobs. It keeps each VM between
 
 Set `vm.initialMemGiB` below `vm.memGiB` to start smaller. The guest runner
 waits until the controller confirms that initial allocation through QMP.
-Unready starts are serialized, and their ready marker is cleared before reuse.
+Each unready start reserves its initial allocation, and its ready marker is
+cleared before reuse. Parallel starts remain subject to the host budget.
 Admission budgets committed allocations and RAM already granted but not yet
 resident, rather than reserving every guest’s full ceiling. Established elastic
 guests grow on guest pressure instead of expanding merely because the host is idle.

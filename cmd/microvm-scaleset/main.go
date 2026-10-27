@@ -608,11 +608,6 @@ func (p *pool) memoryRoom(running int, mem map[string]float64) (int, string) {
 	if n <= 0 {
 		return 0, fmt.Sprintf("%.1f GiB given to %d VMs, %.0f%% of the %.1f GiB usable", given, running, given/usable*100, usable)
 	}
-	for slot, o := range p.owners {
-		if o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < o.record.MemoryGiB && !p.initialMemoryReady(slot, o.runner) {
-			return 0, "waiting for initial guest memory allocation"
-		}
-	}
 	growth, emergency := p.growthReservation(time.Now())
 	if emergency {
 		return 0, "guest memory emergency; awaiting safe growth"
