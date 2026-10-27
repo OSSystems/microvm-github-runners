@@ -28,6 +28,11 @@ in
       [ "services" "microvm-github-runners" "urls" ]
       (config: [ config.services.microvm-github-runners.url ])
     )
+    (lib.mkChangedOptionModule
+      [ "services" "microvm-github-runners" "memOvercommit" ]
+      [ "services" "microvm-github-runners" "memCommitRatio" ]
+      (config: 1.0 + config.services.microvm-github-runners.memOvercommit)
+    )
   ];
 
   options.services.microvm-github-runners = {
@@ -79,6 +84,17 @@ in
         type = lib.types.ints.positive;
         default = 8;
       };
+      cpuWeight = lib.mkOption {
+        type = lib.types.ints.between 1 10000;
+        default = 100;
+        description = "Relative CPU share of each VM under contention. Idle CPU remains available for bursts.";
+      };
+      cpuQuotaPercent = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = null;
+        example = 400;
+        description = "Optional CPU ceiling for each VM process; 400 permits four CPUs. Host-side Nix builds run separately.";
+      };
       diskGiB = lib.mkOption {
         type = lib.types.ints.positive;
         default = 100;
@@ -95,16 +111,34 @@ in
       default = 8;
       description = "Memory always left for the host when deciding to boot another VM.";
     };
-    memOvercommit = lib.mkOption {
+    memCommitRatio = lib.mkOption {
       type = lib.types.float;
-      default = 0.0;
-      example = 0.3;
+      default = 1.0;
+      example = 1.3;
       description = ''
-        How far the memory given to the VMs may exceed the host's, less
-        `memReserveGiB`; 0.3 lets them add up to 130% of it. VMs return the
-        memory they free, so they rarely use all they were given at once.
-        Another VM still only boots while the host has its memory available.
+        Maximum total boot memory divided by host RAM after memReserveGiB.
+        1.0 permits 100%, 1.3 permits 130%, and 2.0 permits 200%.
+        Available host memory and pending VM growth also limit new boots.
+        Ballooning does not reduce this nominal commitment.
       '';
+    };
+    balloon = {
+      enable = lib.mkEnableOption "pressure-driven guest memory reclamation";
+      floorGiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = lib.min 8 cfg.vm.memGiB;
+        description = "Lowest guest allocation during reclamation; the boot ceiling remains vm.memGiB.";
+      };
+      headroomGiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 2;
+        description = "Available memory to retain inside each guest when reclaiming cache.";
+      };
+      canarySlot = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Restrict reclamation to one slot during rollout; null enables it across the shared pool.";
+      };
     };
 
     network = {
@@ -138,6 +172,20 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.memCommitRatio >= 1.0;
+        message = "microvm-github-runners.memCommitRatio must be at least 1.0.";
+      }
+      {
+        assertion = cfg.balloon.floorGiB <= cfg.vm.memGiB;
+        message = "microvm-github-runners.balloon.floorGiB exceeds vm.memGiB.";
+      }
+      {
+        assertion = cfg.balloon.canarySlot == null || builtins.elem cfg.balloon.canarySlot slotNames;
+        message = "microvm-github-runners.balloon.canarySlot must name a configured slot.";
+      }
+    ];
     microvm.vms = lib.listToAttrs (
       map (slot: {
         inherit (slot) name;
@@ -194,12 +242,20 @@ in
                 "--slots=${lib.concatStringsSep "," slotNames}"
                 "--vm-mem=${toString cfg.vm.memGiB}"
                 "--mem-reserve=${toString cfg.memReserveGiB}"
-                "--mem-overcommit=${toString cfg.memOvercommit}"
+                "--mem-commit-ratio=${toString cfg.memCommitRatio}"
+                "--state-dir=${config.microvm.stateDir}"
+                "--balloon-enable=${lib.boolToString cfg.balloon.enable}"
+                "--balloon-floor=${toString cfg.balloon.floorGiB}"
+                "--balloon-headroom=${toString cfg.balloon.headroomGiB}"
+                "--balloon-slot=${if cfg.balloon.canarySlot == null then "" else cfg.balloon.canarySlot}"
                 "--max-load-per-cpu=${toString cfg.maxLoadPerCpu}"
               ]
             );
             Restart = "always";
             RestartSec = "10s";
+            RuntimeDirectory = "microvm-scaleset";
+            RuntimeDirectoryMode = "0750";
+            RuntimeDirectoryPreserve = "restart";
           };
         };
 
@@ -215,7 +271,13 @@ in
       }
       // lib.genAttrs (map (n: "microvm@${n}") slotNames) (_: {
         # A VM powers off after its one job and waits for microvm-scaleset.
-        serviceConfig.Restart = lib.mkForce "no";
+        serviceConfig = {
+          Restart = lib.mkForce "no";
+          CPUAccounting = true;
+          MemoryAccounting = true;
+          CPUWeight = cfg.vm.cpuWeight;
+          CPUQuota = lib.mkIf (cfg.vm.cpuQuotaPercent != null) "${toString cfg.vm.cpuQuotaPercent}%";
+        };
       });
 
       tmpfiles.rules = map (n: "d /run/microvm-jit/${n} 0750 root kvm -") slotNames;

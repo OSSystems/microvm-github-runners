@@ -32,14 +32,33 @@ holds no slots, and when several have jobs waiting, free VMs go to them in
 turn. It boots one VM from the pool per assigned job, and grows only while:
 
 - the 1-minute load average per CPU is below `maxLoadPerCpu`,
-- the memory given to all VMs stays within the host's, less `memReserveGiB`,
-  plus `memOvercommit` (0.3 allows 130%), and
-- available memory still covers another VM after `memReserveGiB`.
+- total boot memory stays within `(host RAM - memReserveGiB) * memCommitRatio`, and
+- available host memory covers another VM, the host reserve, and reserved VM growth.
 
-VMs hand the memory they free back to the host (free page reporting) and their
-disks bypass the host's page cache, so a VM only holds what its job uses.
-Overcommitting pairs well with zram on the host to absorb the rare moment
-when every VM peaks at once.
+`memCommitRatio = 1.0` permits 100% of usable host RAM; `2.0` permits 200%.
+The deprecated `memOvercommit = x` setting maps to `memCommitRatio = 1 + x`.
+Sixteen slots do not guarantee sixteen concurrent jobs: memory and CPU limits
+can hold the running count below the slot count.
+
+Free page reporting returns unused guest pages to the host, and VM disks
+bypass the host's page cache. Guest filesystem caches can still retain RAM.
+Optional balloon reclamation releases that cache under pressure while keeping
+one shared pool for light and heavy jobs. It keeps each VM between
+`balloon.floorGiB` and its original boot ceiling, `vm.memGiB`, with
+`balloon.headroomGiB` available inside the guest.
+
+Reclamation requires fresh guest statistics, waits 90 seconds after boot,
+and shrinks by at most 256 MiB every 30 seconds. Growth also requires host
+headroom, including when reclamation is disabled. Stale statistics freeze
+target changes. An observed guest OOM or emergency balloon deflation disables
+further reclamation for that boot. Emergency deflation can consume host
+headroom, so overcommit remains a tradeoff rather than a hard reserve guarantee.
+
+Ownership is saved before each boot, so a controller restart restores the
+organization, runner name, boot ceiling, and pending-start reservation. For
+older guests, the controller confirms the JIT runner identity against each
+organization before adopting it. An unresolved active owner inhibits new boots;
+the controller does not stop that VM or replace its credentials.
 
 When the host is busy it boots no new VMs; the jobs it accepted wait for one
 instead of overloading the machine.
@@ -66,7 +85,21 @@ instead of overloading the machine.
     };
     network.externalInterface = "enp6s0";
     poolSize = 8;
-    vm = { memGiB = 10; vcpu = 8; diskGiB = 100; };
+    vm = {
+      memGiB = 10;
+      vcpu = 8;
+      diskGiB = 100;
+      cpuWeight = 100;       # elastic CPU sharing under contention
+      cpuQuotaPercent = null; # optional hard ceiling; 400 permits four CPUs
+    };
+    memReserveGiB = 8;
+    memCommitRatio = 1.0;
+    balloon = {
+      enable = false;       # deploy telemetry first, then enable a canary
+      floorGiB = 8;
+      headroomGiB = 2;
+      canarySlot = null;     # e.g. "my-microvm-1" during rollout
+    };
 
     # Anything jobs need on top of the base image.
     guestModules = [
@@ -83,6 +116,31 @@ permission and must be installed on every organization in `urls`.
 
 The host needs KVM. VMs use QEMU, a `/24` bridge with NAT (`network.subnet`,
 default `10.231.0`) and vsock CIDs 3 and up.
+
+## Observe and tune
+
+The controller writes `/run/microvm-scaleset/status.json` with host headroom,
+nominal commitment, the current admission gate, organization counts, and
+per-guest balloon statistics, cgroup memory, swap, and observed peaks. Completed
+runners emit a `runner memory summary` journal entry so observed peaks remain
+available after a slot is reused. These are sampled values, not guaranteed peaks.
+
+```sh
+sudo jq . /run/microvm-scaleset/status.json
+sudo journalctl -u microvm-scaleset --grep='runner memory summary'
+```
+
+Start with reclamation disabled. Check ownership recovery across a controller
+restart, then enable it for one slot with `balloon.canarySlot`. Confirm that
+the VM cgroup's memory falls after reclamation and that guest OOM counts do not
+rise before widening the rollout. Changing VM sizing only affects later boots;
+deployment does not restart running guests.
+
+`cpuWeight` permits bursts when other work is idle. `cpuQuotaPercent` caps the
+VM process and can be changed through systemd without rebooting the guest.
+Host-side Nix builds and virtiofs processes run in separate services and are
+not included in that per-VM CPU quota. Avoid cgroup `MemoryMax` below a VM's
+boot ceiling: it can kill the VM instead of reclaiming guest cache.
 
 ## Status
 
