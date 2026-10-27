@@ -199,12 +199,13 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 
 // pool hands one set of microVMs to the scale sets of every organization.
 type pool struct {
-	cfg        config
-	logger     *slog.Logger
-	sets       []*scaleSet
-	slots      []string
-	mu         sync.Mutex
-	busyReason string
+	cfg              config
+	logger           *slog.Logger
+	sets             []*scaleSet
+	slots            []string
+	mu               sync.Mutex
+	busyReason       string
+	unresolvedOwners bool
 	// booting holds slots started recently; systemd reports them inactive
 	// until their start job runs.
 	booting map[string]time.Time
@@ -393,6 +394,7 @@ func (p *pool) reconcile(ctx context.Context) map[*scaleSet]int {
 		delete(p.ownerRetry, slot)
 		free = append(free, slot)
 	}
+	p.unresolvedOwners = unknown > 0
 	room, reason := p.room(len(p.slots) - len(free))
 	if unknown > 0 {
 		room = 0

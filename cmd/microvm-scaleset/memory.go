@@ -242,7 +242,7 @@ func (p *pool) controlMemory(ctx context.Context, slot string, o owner, s vmSamp
 		}
 	}
 	ownerNow, exists := p.owners[slot]
-	stillOwned := exists && ownerNow.runner == o.runner
+	stillOwned := exists && ownerNow.runner == o.runner && !p.unresolvedOwners
 	p.mu.Unlock()
 	if !stillOwned {
 		return
@@ -267,7 +267,7 @@ func (p *pool) controlMemory(ctx context.Context, slot string, o owner, s vmSamp
 	}
 	p.mu.Lock()
 	current, ok := p.owners[slot]
-	same := ok && current.runner == o.runner
+	same := ok && current.runner == o.runner && !p.unresolvedOwners
 	p.mu.Unlock()
 	if !same {
 		return

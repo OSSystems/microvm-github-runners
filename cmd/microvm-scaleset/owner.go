@@ -211,9 +211,11 @@ func (p *pool) restoreOwner(ctx context.Context, slot string, active bool) error
 }
 
 func (p *pool) recoverOwners(ctx context.Context) {
+	p.unresolvedOwners = false
 	for _, slot := range p.slots {
 		active := vmRunning(slot)
 		if err := p.restoreOwner(ctx, slot, active); err != nil && active {
+			p.unresolvedOwners = true
 			p.logger.Warn("runner ownership unresolved; new boots inhibited", "slot", slot, "error", err)
 			p.ownerRetry[slot] = time.Now().Add(time.Minute)
 		}
