@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -188,5 +189,45 @@ func TestBalloonDoesNotChurnAtPressureBoundary(t *testing.T) {
 	s := vmSample{ObservedAt: now, FreshSamples: 4, Guest: guestMemory{ActualBytes: 9 * gib, CeilingBytes: 10 * gib, AvailableBytes: 6 * gib, OOMKills: 0, UpdatedAt: now.Unix()}}
 	if got := balloonTarget(c, r, s, 18.25, true, now); got != 9*gib {
 		t.Fatalf("boundary caused growth to %.2f GiB, want steady 9 GiB", float64(got)/float64(gib))
+	}
+}
+
+func TestElasticAdmissionBudgetsAllocationInsteadOfCeiling(t *testing.T) {
+	now := time.Now()
+	p := &pool{cfg: config{jitDir: t.TempDir(), vmMemGiB: 16, vmInitialMemGiB: 4, memReserveGiB: 8, memCommitRatio: 2, balloonHeadroomGiB: 1}, owners: map[string]owner{}, samples: map[string]vmSample{}}
+	for i := 0; i < 6; i++ {
+		slot := fmt.Sprintf("slot-%d", i)
+		r := ownerRecord{Runner: slot, MemoryGiB: 16, InitialMemoryGiB: 4, StartedAt: now.Add(-time.Minute)}
+		p.owners[slot] = owner{runner: slot, record: r}
+		if err := os.MkdirAll(filepath.Join(p.cfg.jitDir, slot, "control"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p.cfg.jitDir, slot, "control", "ready"), []byte(slot), 0644); err != nil {
+			t.Fatal(err)
+		}
+		p.samples[slot] = vmSample{Runner: slot, ObservedAt: now, RAMBytes: 4 * gib, TargetBytes: 4 * gib, Guest: guestMemory{ActualBytes: 4 * gib, CeilingBytes: 16 * gib, AvailableBytes: 2 * gib, UpdatedAt: now.Unix(), OOMKills: 0}}
+	}
+	if n, reason := p.memoryRoom(6, map[string]float64{"MemTotal": 64, "MemAvailable": 40}); n != 8 {
+		t.Fatalf("room=%d (%s), want 8 additional starts", n, reason)
+	}
+	os.Remove(filepath.Join(p.cfg.jitDir, "slot-0", "control", "ready"))
+	if n, _ := p.memoryRoom(6, map[string]float64{"MemTotal": 64, "MemAvailable": 40}); n != 0 {
+		t.Fatal("admitted another startup before initial allocation confirmed")
+	}
+}
+
+func TestElasticGuestDoesNotExpandJustBecauseHostIsIdle(t *testing.T) {
+	now := time.Now()
+	c := config{vmMemGiB: 16, vmInitialMemGiB: 4, balloonEnabled: true, balloonFloorGiB: 3, balloonHeadroomGiB: 1, memReserveGiB: 8}
+	r := ownerRecord{MemoryGiB: 16, InitialMemoryGiB: 4, StartedAt: now.Add(-time.Hour)}
+	s := vmSample{ObservedAt: now, Guest: guestMemory{ActualBytes: 4 * gib, CeilingBytes: 16 * gib, AvailableBytes: 2 * gib, UpdatedAt: now.Unix(), OOMKills: 0}}
+	if got := balloonTarget(c, r, s, 50, false, now); got != 4*gib {
+		t.Fatalf("idle host expanded light guest to %d", got)
+	}
+	s.Runner = "runner"
+	s.RAMBytes = gib
+	growth, urgent := slotGrowthReservation(c, owner{runner: "runner", record: r}, s, now)
+	if growth != 3 || urgent {
+		t.Fatalf("growth=%v urgent=%v, want 3 GiB of allocated but unfaulted RAM", growth, urgent)
 	}
 }

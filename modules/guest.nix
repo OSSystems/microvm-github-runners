@@ -44,6 +44,12 @@ in
           }
         )
     // {
+      initialMem = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = cfg.mem;
+        defaultText = lib.literalExpression "config.microvm-github-runner.mem";
+        internal = true;
+      };
       package = lib.mkOption {
         type = lib.types.package;
         default = pkgs.github-runner;
@@ -94,7 +100,14 @@ in
           mountPoint = "/nix/.ro-store";
           readOnly = true;
         }
-      ];
+      ]
+      ++ lib.optional (cfg.initialMem < cfg.mem) {
+        proto = "virtiofs";
+        tag = "runner-control";
+        source = "/run/microvm-jit/${cfg.name}/control";
+        mountPoint = "/run/runner-control";
+        readOnly = true;
+      };
       credentialFiles.jitconfig = "/run/microvm-jit/${cfg.name}/jitconfig";
       # Docker data, the runner workspace and home all live here, and the image
       # is deleted before every boot.
@@ -175,13 +188,37 @@ in
     };
     security.sudo.wheelNeedsPassword = false;
 
+    systemd.services.runner-memory-ready = lib.mkIf (cfg.initialMem < cfg.mem) {
+      unitConfig = {
+        RequiresMountsFor = "/run/runner-control";
+        FailureAction = "poweroff";
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        TimeoutStartSec = "125s";
+      };
+      script = ''
+        for ((attempt = 0; attempt < 120; attempt++)); do
+          if test -f /run/runner-control/ready; then
+            exit 0
+          fi
+          ${pkgs.coreutils}/bin/sleep 1
+        done
+        echo "Host did not establish the initial memory allocation" >&2
+        exit 1
+      '';
+    };
+
     systemd.services.github-runner = {
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
+      requires = lib.optional (cfg.initialMem < cfg.mem) "runner-memory-ready.service";
       after = [
         "network-online.target"
         "docker.service"
-      ];
+      ]
+      ++ lib.optional (cfg.initialMem < cfg.mem) "runner-memory-ready.service";
       # The setuid sudo; the one in the store is not.
       path = [
         "/run/wrappers"

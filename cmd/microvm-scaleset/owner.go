@@ -17,12 +17,13 @@ import (
 const bootGrace = 2 * time.Minute
 
 type ownerRecord struct {
-	Version    int       `json:"version"`
-	Org        string    `json:"org"`
-	ScaleSetID int       `json:"scaleSetId"`
-	Runner     string    `json:"runner"`
-	StartedAt  time.Time `json:"startedAt"`
-	MemoryGiB  float64   `json:"memoryGiB"`
+	Version          int       `json:"version"`
+	Org              string    `json:"org"`
+	ScaleSetID       int       `json:"scaleSetId"`
+	Runner           string    `json:"runner"`
+	StartedAt        time.Time `json:"startedAt"`
+	MemoryGiB        float64   `json:"memoryGiB"`
+	InitialMemoryGiB float64   `json:"initialMemoryGiB,omitempty"`
 }
 
 type runnerIdentity struct {
@@ -122,7 +123,7 @@ func (p *pool) readOwner(slot string) (ownerRecord, error) {
 	if err != nil {
 		return r, err
 	}
-	if json.Unmarshal(b, &r) != nil || r.Version != 1 || r.Org == "" || r.ScaleSetID <= 0 || !strings.HasPrefix(r.Runner, slot+"-") || r.StartedAt.IsZero() || r.StartedAt.After(time.Now().Add(time.Minute)) || math.IsNaN(r.MemoryGiB) || math.IsInf(r.MemoryGiB, 0) || r.MemoryGiB <= 0 {
+	if json.Unmarshal(b, &r) != nil || r.Version != 1 || r.Org == "" || r.ScaleSetID <= 0 || !strings.HasPrefix(r.Runner, slot+"-") || r.StartedAt.IsZero() || r.StartedAt.After(time.Now().Add(time.Minute)) || math.IsNaN(r.MemoryGiB) || math.IsInf(r.MemoryGiB, 0) || r.MemoryGiB <= 0 || math.IsNaN(r.InitialMemoryGiB) || math.IsInf(r.InitialMemoryGiB, 0) || r.InitialMemoryGiB < 0 || r.InitialMemoryGiB > r.MemoryGiB {
 		return r, errors.New("invalid owner record")
 	}
 	return r, nil

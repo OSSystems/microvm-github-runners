@@ -80,6 +80,12 @@ in
         type = lib.types.ints.positive;
         default = 10;
       };
+      initialMemGiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = cfg.vm.memGiB;
+        defaultText = lib.literalExpression "config.services.microvm-github-runners.vm.memGiB";
+        description = "Guest allocation established before the runner starts; memGiB remains the maximum.";
+      };
       vcpu = lib.mkOption {
         type = lib.types.ints.positive;
         default = 8;
@@ -116,10 +122,10 @@ in
       default = 1.0;
       example = 1.3;
       description = ''
-        Maximum total boot memory divided by host RAM after memReserveGiB.
+        Maximum committed allocations divided by host RAM after memReserveGiB.
         1.0 permits 100%, 1.3 permits 130%, and 2.0 permits 200%.
         Available host memory and pending VM growth also limit new boots.
-        Ballooning does not reduce this nominal commitment.
+        Elastic guests commit their current allocation, not their maximum ceiling.
       '';
     };
     balloon = {
@@ -178,8 +184,8 @@ in
         message = "microvm-github-runners.memCommitRatio must be at least 1.0.";
       }
       {
-        assertion = cfg.balloon.floorGiB <= cfg.vm.memGiB;
-        message = "microvm-github-runners.balloon.floorGiB exceeds vm.memGiB.";
+        assertion = cfg.balloon.floorGiB <= cfg.vm.initialMemGiB && cfg.vm.initialMemGiB <= cfg.vm.memGiB;
+        message = "microvm-github-runners requires balloon.floorGiB <= vm.initialMemGiB <= vm.memGiB.";
       }
       {
         assertion = cfg.balloon.canarySlot == null || builtins.elem cfg.balloon.canarySlot slotNames;
@@ -206,6 +212,7 @@ in
               tap = "ghrunner${toString slot.index}";
               cid = 2 + slot.index;
               mem = cfg.vm.memGiB * 1024;
+              initialMem = cfg.vm.initialMemGiB * 1024;
             };
           };
         };
@@ -241,6 +248,7 @@ in
                 "--private-key-file=${cfg.githubApp.privateKeyFile}"
                 "--slots=${lib.concatStringsSep "," slotNames}"
                 "--vm-mem=${toString cfg.vm.memGiB}"
+                "--vm-initial-mem=${toString cfg.vm.initialMemGiB}"
                 "--mem-reserve=${toString cfg.memReserveGiB}"
                 "--mem-commit-ratio=${toString cfg.memCommitRatio}"
                 "--state-dir=${config.microvm.stateDir}"
@@ -280,7 +288,10 @@ in
         };
       });
 
-      tmpfiles.rules = map (n: "d /run/microvm-jit/${n} 0750 root kvm -") slotNames;
+      tmpfiles.rules = lib.concatMap (n: [
+        "d /run/microvm-jit/${n} 0750 root kvm -"
+        "d /run/microvm-jit/${n}/control 0755 root root -"
+      ]) slotNames;
 
       network = {
         enable = true;
