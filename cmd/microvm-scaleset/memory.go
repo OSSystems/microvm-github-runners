@@ -265,6 +265,10 @@ func (p *pool) controlMemory(ctx context.Context, slot string, o owner, s vmSamp
 		return
 	}
 	available := mem["MemAvailable"] - otherGrowth
+	if o.record.InitialMemoryGiB > 0 && o.record.InitialMemoryGiB < o.record.MemoryGiB {
+		ownGrowth, _ := slotGrowthReservation(p.cfg, o, s, time.Now())
+		available -= ownGrowth
+	}
 	policy := p.cfg
 	if policy.balloonSlot != "" && policy.balloonSlot != slot {
 		policy.balloonEnabled = false
