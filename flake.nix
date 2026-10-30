@@ -28,6 +28,7 @@
           microvm.nixosModules.host
           ./modules/host.nix
         ];
+        services.microvm-github-runners.microvmGuestModule = microvm.nixosModules.microvm;
       };
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
