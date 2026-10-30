@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,7 +70,7 @@ func TestRestartCountsExistingRunner(t *testing.T) {
 	}
 	set := &scaleSet{org: "example", id: 1, assigned: 1, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	p := &pool{cfg: config{jitDir: dir, vmMemGiB: 10, memReserveGiB: 1e9}, slots: []string{slot}, sets: []*scaleSet{set}, owners: map[string]owner{}, booting: map[string]time.Time{}, logger: set.logger}
-	set.pool = p
+	set.backend = p
 	for i := 0; i < 2; i++ {
 		if got := p.reconcile(context.Background())[set]; got != 1 {
 			t.Fatalf("running after controller restart = %d, want existing runner counted once", got)
@@ -81,7 +82,7 @@ func TestRestartCountsExistingRunner(t *testing.T) {
 }
 
 func TestMemoryFlags(t *testing.T) {
-	for _, args := range [][]string{{"--mem-overcommit=1"}, {"--mem-commit-ratio=2"}} {
+	for _, args := range [][]string{{"--backend=qemu", "--slots=a", "--mem-overcommit=1"}, {"--backend=qemu", "--slots=a", "--mem-commit-ratio=2"}} {
 		c, err := parseConfig(args)
 		if err != nil {
 			t.Fatal(err)
@@ -90,7 +91,7 @@ func TestMemoryFlags(t *testing.T) {
 			t.Fatalf("ratio = %v, want 2", c.memCommitRatio)
 		}
 	}
-	for _, args := range [][]string{{"--mem-overcommit=1", "--mem-commit-ratio=2"}, {"--mem-commit-ratio=NaN"}, {"--vm-mem=0"}, {"--mem-reserve=-1"}, {"--balloon-enable", "--vm-mem=4", "--balloon-floor=8"}} {
+	for _, args := range [][]string{{"--backend=qemu", "--slots=a", "--mem-overcommit=1", "--mem-commit-ratio=2"}, {"--backend=qemu", "--slots=a", "--mem-commit-ratio=NaN"}, {"--backend=qemu", "--slots=a", "--vm-mem=0"}, {"--backend=qemu", "--slots=a", "--mem-reserve=-1"}, {"--backend=qemu", "--slots=a", "--balloon-enable", "--vm-mem=4", "--balloon-floor=8"}} {
 		if _, err := parseConfig(args); err == nil {
 			t.Fatalf("accepted invalid settings %v", args)
 		}
@@ -239,5 +240,11 @@ func TestBalloonWaitsForStatsAfterResize(t *testing.T) {
 	s := vmSample{ObservedAt: now, ResizedAt: now.Add(-time.Second), Guest: guestMemory{ActualBytes: 3 * gib, CeilingBytes: 16 * gib, AvailableBytes: gib / 2, UpdatedAt: now.Add(-2 * time.Second).Unix(), OOMKills: 0}}
 	if got := balloonTarget(c, r, s, 40, true, now); got != 3*gib {
 		t.Fatalf("reused pre-resize stats to grant %d bytes", got)
+	}
+}
+
+func TestQEMUBackendNeedsSlots(t *testing.T) {
+	if _, err := parseConfig([]string{"--backend=qemu"}); err == nil || !strings.Contains(err.Error(), "--slots") {
+		t.Fatalf("parseConfig = %v, want --slots required", err)
 	}
 }
