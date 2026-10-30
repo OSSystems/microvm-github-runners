@@ -15,7 +15,7 @@ let
   hostAddress = "${cfg.network.subnet}.1";
   nixDaemonPort = 5000;
   controlPort = 5001;
-  package = pkgs.callPackage ../package.nix { };
+  package = pkgs.callPackage ../../../package.nix { };
   isQemu = cfg.backend == "qemu";
   commonFlags = map (url: "--url=${url}") cfg.urls ++ [
     "--name=${cfg.name}"
