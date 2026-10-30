@@ -3,7 +3,8 @@
 // them draw from one pool of VMs, so an idle organization leaves its share to
 // the busy ones. The number of VMs grows with demand for as long as the host
 // has spare CPU and memory, so a busy host stops taking new work instead of
-// overcommitting.
+// overcommitting. The cloud-hypervisor backend boots one VM per job with no
+// pool size; the legacy QEMU backend runs a fixed set of microvm.nix slots.
 package main
 
 import (
@@ -55,11 +56,30 @@ type config struct {
 	balloonFloorGiB    float64
 	balloonHeadroomGiB float64
 	balloonSlot        string
+
+	backend string
+	ch      chConfig
 }
+
+const (
+	backendCloudHypervisor = "cloud-hypervisor"
+	backendQEMU            = "qemu"
+)
 
 func parseConfig(args []string) (config, error) {
 	var c config
 	f := flag.NewFlagSet("microvm-scaleset", flag.ContinueOnError)
+	f.StringVar(&c.backend, "backend", backendQEMU, "hypervisor backend: qemu (legacy) or cloud-hypervisor")
+	f.StringVar(&c.ch.guestManifest, "guest-manifest", "", "cloud-hypervisor: guest manifest JSON")
+	f.StringVar(&c.ch.bridge, "bridge", "", "cloud-hypervisor: bridge the VM taps join")
+	f.StringVar(&c.ch.subnet, "subnet", "", "cloud-hypervisor: first three octets of the VM /24")
+	f.StringVar(&c.ch.workDir, "work-dir", "/var/lib/microvm-scaleset", "cloud-hypervisor: per-VM sockets and disks")
+	f.StringVar(&c.ch.vmUser, "vm-user", "microvm", "cloud-hypervisor: user the hypervisor runs as")
+	f.Float64Var(&c.ch.memReservePercent, "mem-reserve-percent", 10, "cloud-hypervisor: host memory reserve, percent of MemTotal")
+	f.Float64Var(&c.ch.memReserveMinGiB, "mem-reserve-min-gib", 2, "cloud-hypervisor: minimum host memory reserve, GiB")
+	f.Float64Var(&c.ch.diskReservePercent, "disk-reserve-percent", 10, "cloud-hypervisor: free space kept on --work-dir, percent")
+	f.IntVar(&c.ch.nixDaemonPort, "nix-daemon-port", 5000, "cloud-hypervisor: guest vsock port of the Nix daemon")
+	f.IntVar(&c.ch.controlPort, "control-port", 5001, "cloud-hypervisor: guest vsock port of the control channel")
 	f.Func("url", "organization URL; repeat to share the pool", func(v string) error { c.urls = append(c.urls, v); return nil })
 	f.StringVar(&c.name, "name", "", "scale set name in every organization")
 	f.StringVar(&c.labels, "labels", "", "comma-separated labels (defaults to the name)")
@@ -95,29 +115,53 @@ func parseConfig(args []string) (config, error) {
 	if !supplied["vm-initial-mem"] {
 		c.vmInitialMemGiB = c.vmMemGiB
 	}
-	for _, v := range []float64{c.vmInitialMemGiB, c.maxLoadPerCPU, c.vmMemGiB, c.memCommitRatio, c.balloonFloorGiB, c.balloonHeadroomGiB} {
-		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
-			return c, errors.New("memory and load settings must be finite and positive")
+	switch c.backend {
+	case backendQEMU:
+		if err := c.validateQEMU(); err != nil {
+			return c, err
 		}
-	}
-	if c.memCommitRatio < 1 || math.IsNaN(c.memReserveGiB) || math.IsInf(c.memReserveGiB, 0) || c.memReserveGiB < 0 {
-		return c, errors.New("commit ratio must be at least 1 and reserve must be nonnegative")
-	}
-	if c.vmInitialMemGiB > c.vmMemGiB {
-		return c, errors.New("initial memory exceeds VM ceiling")
-	}
-	if c.balloonEnabled && c.balloonFloorGiB > c.vmInitialMemGiB {
-		return c, errors.New("balloon floor exceeds VM boot memory")
-	}
-	for _, slot := range strings.Split(c.slots, ",") {
-		if slot != "" && (filepath.Base(slot) != slot || slot == "." || slot == ".." || strings.ContainsAny(slot, " \t\r\n")) {
-			return c, errors.New("invalid VM slot name")
+	case backendCloudHypervisor:
+		if err := c.validateCloudHypervisor(); err != nil {
+			return c, err
 		}
+	default:
+		return c, fmt.Errorf("unknown backend %q", c.backend)
 	}
 	return c, nil
 }
 
+// validateQEMU checks the settings only the QEMU slot pool uses.
+func (c config) validateQEMU() error {
+	for _, v := range []float64{c.vmInitialMemGiB, c.maxLoadPerCPU, c.vmMemGiB, c.memCommitRatio, c.balloonFloorGiB, c.balloonHeadroomGiB} {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			return errors.New("memory and load settings must be finite and positive")
+		}
+	}
+	if c.memCommitRatio < 1 || math.IsNaN(c.memReserveGiB) || math.IsInf(c.memReserveGiB, 0) || c.memReserveGiB < 0 {
+		return errors.New("commit ratio must be at least 1 and reserve must be nonnegative")
+	}
+	if c.vmInitialMemGiB > c.vmMemGiB {
+		return errors.New("initial memory exceeds VM ceiling")
+	}
+	if c.balloonEnabled && c.balloonFloorGiB > c.vmInitialMemGiB {
+		return errors.New("balloon floor exceeds VM boot memory")
+	}
+	for _, slot := range strings.Split(c.slots, ",") {
+		if slot != "" && (filepath.Base(slot) != slot || slot == "." || slot == ".." || strings.ContainsAny(slot, " \t\r\n")) {
+			return errors.New("invalid VM slot name")
+		}
+	}
+	return nil
+}
+
 func main() {
+	if err := runSubcommand(os.Args[1:]); !errors.Is(err, errNotSubcommand) {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	c, err := parseConfig(os.Args[1:])
 	if errors.Is(err, flag.ErrHelp) {
 		return
@@ -139,8 +183,20 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 	if len(c.urls) == 0 {
 		return errors.New("no --url given")
 	}
-	b := newPool(c, logger)
-	lock, err := os.OpenFile(filepath.Join(c.jitDir, ".controller.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	var b backend
+	lockDir := c.jitDir
+	switch c.backend {
+	case backendQEMU:
+		b = newPool(c, logger)
+	default:
+		chp, err := newCHPool(c, logger)
+		if err != nil {
+			return err
+		}
+		b = chp
+		lockDir = c.ch.workDir
+	}
+	lock, err := os.OpenFile(filepath.Join(lockDir, ".controller.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -193,7 +249,8 @@ func run(ctx context.Context, logger *slog.Logger, c config) error {
 	return context.Cause(ctx)
 }
 
-// backend runs the VMs of every scale set.
+// backend runs the VMs of every scale set: the legacy QEMU slot pool or the
+// elastic cloud-hypervisor pool.
 type backend interface {
 	// maxRunners is how many jobs a scale set may accept at once.
 	maxRunners() int
@@ -207,6 +264,8 @@ type backend interface {
 	desiredRunners(ctx context.Context, s *scaleSet, assigned int) int
 	// tick frees VMs that powered off and boots VMs for waiting jobs.
 	tick(ctx context.Context)
+	// jobCompleted notes that GitHub reported the job of runner on s done.
+	jobCompleted(s *scaleSet, runner string, now time.Time)
 }
 
 func newPool(c config, logger *slog.Logger) *pool {
@@ -235,6 +294,9 @@ func (p *pool) start(ctx context.Context, sets []*scaleSet) {
 }
 
 func (p *pool) background(ctx context.Context) { p.telemetryLoop(ctx) }
+
+// jobCompleted does nothing: a QEMU slot's VM powers off by itself.
+func (p *pool) jobCompleted(*scaleSet, string, time.Time) {}
 
 func (p *pool) tick(ctx context.Context) {
 	p.mu.Lock()
@@ -385,6 +447,9 @@ func (s *scaleSet) HandleJobStarted(_ context.Context, job *scaleset.JobStarted)
 
 func (s *scaleSet) HandleJobCompleted(_ context.Context, job *scaleset.JobCompleted) error {
 	s.logger.Info("job completed", "runner", job.RunnerName, "job", job.JobID, "result", job.Result)
+	if s.backend != nil {
+		s.backend.jobCompleted(s, job.RunnerName, time.Now())
+	}
 	return nil
 }
 
