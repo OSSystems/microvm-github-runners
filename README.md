@@ -4,7 +4,8 @@ GitHub Actions self-hosted runners for NixOS where **every job runs in its own
 throwaway microVM**, and the number of VMs follows the host's spare CPU and
 memory.
 
-Built on [microvm.nix](https://github.com/microvm-nix/microvm.nix) and the
+Built on [cloud-hypervisor](https://www.cloudhypervisor.org/),
+[microvm.nix](https://github.com/microvm-nix/microvm.nix) and the
 [actions/scaleset](https://github.com/actions/scaleset) client. No Kubernetes.
 
 ## Why
@@ -27,47 +28,31 @@ Here each job gets:
 
 `microvm-scaleset` registers a [runner scale set](https://github.com/actions/scaleset#what-is-a-scale-set)
 in every organization listed in `urls` and tells GitHub how many jobs the host
-can take right now. All scale sets share one pool of VMs: an idle organization
-holds no slots, and when several have jobs waiting, free VMs go to them in
-turn. It boots one VM from the pool per assigned job, and grows only while:
+can take right now. All organizations share the host: an idle one holds
+nothing, and when several have jobs waiting, they take turns. Each assigned job
+gets one [cloud-hypervisor](https://www.cloudhypervisor.org/) VM.
+
+Nothing is sized per host. Every VM sees all host CPUs, boots with 2 GiB of
+memory and grows from there: the guest reports its available memory and
+memory pressure every two seconds, and the controller plugs memory in 1 GiB
+steps (virtio-mem) while the guest is under pressure and unplugs it once the
+guest has had plenty to spare for a while. Memory a job frees goes back to the
+host through free page reporting. Under CPU contention VMs share the CPUs
+equally.
+
+A new VM boots only while:
 
 - the 1-minute load average per CPU is below `maxLoadPerCpu`,
-- committed allocations stay within `(host RAM - memReserveGiB) * memCommitRatio`, and
-- available host memory covers another VM, the host reserve, and reserved VM growth.
+- available host memory, minus the reserve and VMs still booting, covers the
+  boot memory, and
+- the `workDir` file system has more free space than its reserve.
 
-`memCommitRatio = 1.0` permits 100% of usable host RAM; `2.0` permits 200%.
-The deprecated `memOvercommit = x` setting maps to `memCommitRatio = 1 + x`.
-Sixteen slots do not guarantee sixteen concurrent jobs: memory and CPU limits
-can hold the running count below the slot count.
-
-Free page reporting returns unused guest pages to the host, and VM disks
-bypass the host's page cache. Guest filesystem caches can still retain RAM.
-Optional balloon reclamation releases that cache under pressure while keeping
-one shared pool for light and heavy jobs. It keeps each VM between
-`balloon.floorGiB` and its original boot ceiling, `vm.memGiB`, with
-`balloon.headroomGiB` available inside the guest.
-
-Set `vm.initialMemGiB` below `vm.memGiB` to start smaller. The guest runner
-waits until the controller confirms that initial allocation through QMP.
-Each unready start reserves its initial allocation, and its ready marker is
-cleared before reuse. Parallel starts remain subject to the host budget.
-Admission budgets committed allocations and RAM already granted but not yet
-resident, rather than reserving every guest’s full ceiling. Established elastic
-guests grow on guest pressure instead of expanding merely because the host is idle.
-The ceiling is a limit, not a promise that every guest can reach it simultaneously.
-
-Reclamation requires fresh guest statistics, waits 90 seconds after boot,
-and shrinks by at most 256 MiB every 30 seconds. Growth also requires host
-headroom, including when reclamation is disabled. Stale statistics freeze
-target changes. An observed guest OOM or emergency balloon deflation disables
-further reclamation for that boot. Emergency deflation can consume host
-headroom, so overcommit remains a tradeoff rather than a hard reserve guarantee.
-
-Ownership is saved before each boot, so a controller restart restores the
-organization, runner name, boot ceiling, and pending-start reservation. For
-older guests, the controller confirms the JIT runner identity against each
-organization before adopting it. An unresolved active owner inhibits new boots;
-the controller does not stop that VM or replace its credentials.
+The memory reserve is `memReservePercent` (default 10%) of host RAM, at least
+2 GiB; no VM grows into it either, so when the host is full a guest under
+pressure may run out of memory, never the host. The disk reserve is
+`diskReservePercent` (default 10%). Each VM's disk is an empty sparse file the
+guest formats on boot, and only takes the space the job writes. `/tmp` lives
+on that disk too, so large temporary files cost disk, not memory.
 
 When the host is busy it boots no new VMs; the jobs it accepted wait for one
 instead of overloading the machine.
@@ -83,32 +68,15 @@ instead of overloading the machine.
 
   services.microvm-github-runners = {
     enable = true;
-    urls = [                        # all share the VM pool
+    urls = [                        # all share the host
       "https://github.com/my-org"
       "https://github.com/my-other-org"
     ];
-    name = "my-microvm";            # workflows use `runs-on: my-microvm`
     githubApp = {
       id = "123456";
       privateKeyFile = "/run/secrets/github-app-key";
     };
     network.externalInterface = "enp6s0";
-    poolSize = 8;
-    vm = {
-      memGiB = 10;
-      vcpu = 8;
-      diskGiB = 100;
-      cpuWeight = 100;       # elastic CPU sharing under contention
-      cpuQuotaPercent = null; # optional hard ceiling; 400 permits four CPUs
-    };
-    memReserveGiB = 8;
-    memCommitRatio = 1.0;
-    balloon = {
-      enable = false;       # deploy telemetry first, then enable a canary
-      floorGiB = 8;
-      headroomGiB = 2;
-      canarySlot = null;     # e.g. "my-microvm-1" during rollout
-    };
 
     # Anything jobs need on top of the base image.
     guestModules = [
@@ -120,36 +88,84 @@ instead of overloading the machine.
 }
 ```
 
+The scale set is named after the host (`name` defaults to
+`networking.hostName`) and workflows can target it with `runs-on: <hostname>`.
+To run a fleet, import the module on every machine and give them all one
+extra label, which workflows target instead:
+
+```nix
+services.microvm-github-runners.labels = [ config.networking.hostName "nix-vm" ];
+```
+
+```yaml
+runs-on: nix-vm
+```
+
+Adding a machine is then importing the module there; its jobs come from the
+same queue.
+
 The GitHub App needs organization *Self-hosted runners: read & write*
 permission and must be installed on every organization in `urls`.
 
-The host needs KVM. VMs use QEMU, a `/24` bridge with NAT (`network.subnet`,
-default `10.231.0`) and vsock CIDs 3 and up.
-
-## Observe and tune
-
-The controller writes `/run/microvm-scaleset/status.json` with host headroom,
-nominal commitment, the current admission gate, organization counts, and
-per-guest balloon statistics, cgroup memory, swap, and observed peaks. Completed
-runners emit a `runner memory summary` journal entry so observed peaks remain
-available after a slot is reused. These are sampled values, not guaranteed peaks.
+The host needs KVM. VMs use a `/24` bridge with NAT (`network.subnet`,
+default `10.231.0`), addresses `.10` to `.254`, and vsock CIDs 3 and up.
 
 ```sh
-sudo jq . /run/microvm-scaleset/status.json
-sudo journalctl -u microvm-scaleset --grep='runner memory summary'
+sudo journalctl -u microvm-scaleset
 ```
 
-Start with reclamation disabled. Check ownership recovery across a controller
-restart, then enable it for one slot with `balloon.canarySlot`. Confirm that
-the VM cgroup's memory falls after reclamation and that guest OOM counts do not
-rise before widening the rollout. Changing VM sizing only affects later boots;
-deployment does not restart running guests.
+A controller restart kills every running VM, so deploys leave
+`microvm-scaleset` running: a changed guest image, controller or flag takes
+effect at its next restart. Restart it when the host is idle, or accept that
+its running jobs fail:
 
-`cpuWeight` permits bursts when other work is idle. `cpuQuotaPercent` caps the
-VM process and can be changed through systemd without rebooting the guest.
-Host-side Nix builds and virtiofs processes run in separate services and are
-not included in that per-VM CPU quota. Avoid cgroup `MemoryMax` below a VM's
-boot ceiling: it can kill the VM instead of reclaiming guest cache.
+```sh
+sudo systemctl restart microvm-scaleset
+```
+
+This holds for the deploy that moves a host from QEMU to cloud-hypervisor
+too: the new unit says not to restart, so the old QEMU controller keeps
+running against slots that no longer exist. Restart `microvm-scaleset` once
+after that first deploy; no cloud-hypervisor VM exists yet, so it costs
+nothing.
+
+## Legacy QEMU backend
+
+`backend = "qemu"` keeps the earlier fixed pool: `poolSize` QEMU VMs declared
+through microvm.nix, each sized by `vm.memGiB`, `vm.vcpu` and `vm.diskGiB`,
+admitted against `memReserveGiB` and `memCommitRatio`, with optional balloon
+reclamation (`balloon.*`). These options apply only to it; setting them with
+the default backend fails evaluation.
+
+```nix
+services.microvm-github-runners = {
+  backend = "qemu";
+  poolSize = 8;
+  vm = {
+    memGiB = 10;
+    initialMemGiB = 10;    # lower to start smaller and grow through QMP
+    vcpu = 8;
+    diskGiB = 100;
+    cpuWeight = 100;       # elastic CPU sharing under contention
+    cpuQuotaPercent = null; # optional hard ceiling; 400 permits four CPUs
+  };
+  memReserveGiB = 8;
+  memCommitRatio = 1.0;    # 2.0 permits 200% of usable host RAM
+  balloon = {
+    enable = false;        # deploy telemetry first, then enable a canary
+    floorGiB = 8;
+    headroomGiB = 2;
+    canarySlot = null;     # e.g. "my-host-1" during rollout
+  };
+};
+```
+
+The controller writes `/run/microvm-scaleset/status.json` with host headroom,
+commitment, the admission gate and per-guest balloon statistics; completed
+runners log a `runner memory summary`. Start with reclamation disabled, check
+ownership recovery across a controller restart, then enable it for one slot
+with `balloon.canarySlot`. Avoid cgroup `MemoryMax` below a VM's boot ceiling:
+it can kill the VM instead of reclaiming guest cache.
 
 ## Status
 
