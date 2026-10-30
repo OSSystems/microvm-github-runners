@@ -69,7 +69,7 @@ func TestRestartCountsExistingRunner(t *testing.T) {
 	}
 	set := &scaleSet{org: "example", id: 1, assigned: 1, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	p := &pool{cfg: config{jitDir: dir, vmMemGiB: 10, memReserveGiB: 1e9}, slots: []string{slot}, sets: []*scaleSet{set}, owners: map[string]owner{}, booting: map[string]time.Time{}, logger: set.logger}
-	set.pool = p
+	set.backend = p
 	for i := 0; i < 2; i++ {
 		if got := p.reconcile(context.Background())[set]; got != 1 {
 			t.Fatalf("running after controller restart = %d, want existing runner counted once", got)
