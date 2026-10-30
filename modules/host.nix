@@ -202,7 +202,7 @@ in
           restartIfChanged = false;
           specialArgs = cfg.guestSpecialArgs;
           config = {
-            imports = [ ./guest.nix ] ++ cfg.guestModules;
+            imports = [ ./guest-qemu.nix ] ++ cfg.guestModules;
             microvm-github-runner = {
               inherit (slot) name;
               inherit hostAddress nixDaemonPort;
