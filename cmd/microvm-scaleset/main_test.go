@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -239,5 +240,11 @@ func TestBalloonWaitsForStatsAfterResize(t *testing.T) {
 	s := vmSample{ObservedAt: now, ResizedAt: now.Add(-time.Second), Guest: guestMemory{ActualBytes: 3 * gib, CeilingBytes: 16 * gib, AvailableBytes: gib / 2, UpdatedAt: now.Add(-2 * time.Second).Unix(), OOMKills: 0}}
 	if got := balloonTarget(c, r, s, 40, true, now); got != 3*gib {
 		t.Fatalf("reused pre-resize stats to grant %d bytes", got)
+	}
+}
+
+func TestQEMUBackendNeedsSlots(t *testing.T) {
+	if _, err := parseConfig([]string{"--backend=qemu"}); err == nil || !strings.Contains(err.Error(), "--slots") {
+		t.Fatalf("parseConfig = %v, want --slots required", err)
 	}
 }

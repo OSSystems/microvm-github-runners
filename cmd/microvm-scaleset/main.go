@@ -69,7 +69,7 @@ const (
 func parseConfig(args []string) (config, error) {
 	var c config
 	f := flag.NewFlagSet("microvm-scaleset", flag.ContinueOnError)
-	f.StringVar(&c.backend, "backend", backendQEMU, "hypervisor backend: qemu (legacy) or cloud-hypervisor")
+	f.StringVar(&c.backend, "backend", backendCloudHypervisor, "hypervisor backend: cloud-hypervisor or qemu (legacy)")
 	f.StringVar(&c.ch.guestManifest, "guest-manifest", "", "cloud-hypervisor: guest manifest JSON")
 	f.StringVar(&c.ch.bridge, "bridge", "", "cloud-hypervisor: bridge the VM taps join")
 	f.StringVar(&c.ch.subnet, "subnet", "", "cloud-hypervisor: first three octets of the VM /24")
@@ -117,6 +117,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	switch c.backend {
 	case backendQEMU:
+		if strings.Trim(c.slots, ",") == "" {
+			return c, errors.New("--backend=qemu needs --slots")
+		}
 		if err := c.validateQEMU(); err != nil {
 			return c, err
 		}
