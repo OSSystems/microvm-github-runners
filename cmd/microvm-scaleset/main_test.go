@@ -81,7 +81,7 @@ func TestRestartCountsExistingRunner(t *testing.T) {
 }
 
 func TestMemoryFlags(t *testing.T) {
-	for _, args := range [][]string{{"--mem-overcommit=1"}, {"--mem-commit-ratio=2"}} {
+	for _, args := range [][]string{{"--backend=qemu", "--slots=a", "--mem-overcommit=1"}, {"--backend=qemu", "--slots=a", "--mem-commit-ratio=2"}} {
 		c, err := parseConfig(args)
 		if err != nil {
 			t.Fatal(err)
@@ -90,7 +90,7 @@ func TestMemoryFlags(t *testing.T) {
 			t.Fatalf("ratio = %v, want 2", c.memCommitRatio)
 		}
 	}
-	for _, args := range [][]string{{"--mem-overcommit=1", "--mem-commit-ratio=2"}, {"--mem-commit-ratio=NaN"}, {"--vm-mem=0"}, {"--mem-reserve=-1"}, {"--balloon-enable", "--vm-mem=4", "--balloon-floor=8"}} {
+	for _, args := range [][]string{{"--backend=qemu", "--slots=a", "--mem-overcommit=1", "--mem-commit-ratio=2"}, {"--backend=qemu", "--slots=a", "--mem-commit-ratio=NaN"}, {"--backend=qemu", "--slots=a", "--vm-mem=0"}, {"--backend=qemu", "--slots=a", "--mem-reserve=-1"}, {"--backend=qemu", "--slots=a", "--balloon-enable", "--vm-mem=4", "--balloon-floor=8"}} {
 		if _, err := parseConfig(args); err == nil {
 			t.Fatalf("accepted invalid settings %v", args)
 		}
