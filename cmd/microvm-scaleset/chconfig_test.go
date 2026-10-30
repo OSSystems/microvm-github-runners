@@ -7,10 +7,7 @@ import (
 )
 
 func TestCloudHypervisorFlags(t *testing.T) {
-	if c, err := parseConfig(nil); err != nil || c.backend != backendQEMU {
-		t.Fatalf("default backend = %q, %v; want qemu", c.backend, err)
-	}
-	base := []string{"--backend=cloud-hypervisor", "--guest-manifest=/m.json", "--bridge=microbr", "--subnet=10.231.0", "--name=ci"}
+	base := []string{"--guest-manifest=/m.json", "--bridge=microbr", "--subnet=10.231.0", "--name=ci"}
 	c, err := parseConfig(base)
 	if err != nil {
 		t.Fatal(err)
@@ -19,9 +16,9 @@ func TestCloudHypervisorFlags(t *testing.T) {
 		t.Fatalf("defaults = %+v", c)
 	}
 	for _, bad := range [][]string{
-		{"--backend=cloud-hypervisor", "--name=ci"},
-		{"--backend=cloud-hypervisor", "--guest-manifest=/m.json", "--bridge=microbr", "--subnet=10.231", "--name=ci"},
-		{"--backend=cloud-hypervisor", "--guest-manifest=/m.json", "--bridge=microbr", "--subnet=10.231.300", "--name=ci"},
+		{"--name=ci"},
+		{"--guest-manifest=/m.json", "--bridge=microbr", "--subnet=10.231", "--name=ci"},
+		{"--guest-manifest=/m.json", "--bridge=microbr", "--subnet=10.231.300", "--name=ci"},
 		append(slices.Clone(base), "--mem-reserve-percent=100"),
 		append(slices.Clone(base), "--control-port=5000"),
 		append(slices.Clone(base), "--work-dir=relative"),
