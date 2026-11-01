@@ -11,20 +11,16 @@ jobs:
   kernel:
     runs-on: octocat-microvm
     steps:
-      - name: Build Linux in a Debian container
+      - name: Build Linux (defconfig) in a Debian container
         run: |
           echo "METRIC nproc=$(nproc)"
-          echo "METRIC mem_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
           curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.6.tar.xz | tar xJ
           docker run --rm -v "$PWD/linux-6.12.6:/src" -w /src debian:bookworm bash -euc '
             apt-get update -qq && apt-get install -y -qq build-essential flex bison bc libelf-dev libssl-dev cpio kmod >/dev/null
-            make -s allmodconfig
-            ./scripts/config -d DEBUG_INFO -e DEBUG_INFO_NONE -d KASAN -d GCOV_KERNEL
-            make -s olddefconfig
-            make -s -j"$(nproc)" prepare >/dev/null
-            for d in drivers/net/wireless drivers/gpu/drm/amd/amdgpu fs sound; do
-              start=$(date +%s%N)
-              make -s -j"$(nproc)" "$d/" >/dev/null
-              echo "METRIC ${d//\//_}_ms=$(( ($(date +%s%N) - start) / 1000000 ))"
-            done
+            make -s defconfig
+            start=$(date +%s%N)
+            make -s -j"$(nproc)" >/dev/null
+            echo "METRIC build_ms=$(( ($(date +%s%N) - start) / 1000000 ))"
           '
+      - if: failure()
+        run: sudo dmesg | tail -60; free -m
