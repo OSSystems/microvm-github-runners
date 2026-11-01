@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: octocat-microvm
+    steps:
+      - uses: actions/checkout@v6
+      - run: nix flake check -L
+      - run: nix fmt -- --check $(git ls-files '*.nix')
