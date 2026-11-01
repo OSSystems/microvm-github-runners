@@ -122,6 +122,14 @@ func (vm *chVM) pending() int64 {
 	return vm.mem.pendingPlug
 }
 
+// committed is what this VM was given, boot plus plugged plus a plug in
+// flight, and room for its next plug: memory it may touch at any moment.
+func (vm *chVM) committed() int64 {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	return vm.mem.actualBytes + vm.mem.pendingPlug + memoryStep
+}
+
 // memorySnapshot updates the VM's actual size and returns its memory state.
 func (vm *chVM) memorySnapshot(actual int64) vmMemory {
 	vm.mu.Lock()
@@ -408,6 +416,15 @@ func pendingBytes(vms []*chVM) int64 {
 	return pending
 }
 
+// committedBytes is the memory vms were given and may take.
+func committedBytes(vms []*chVM) int64 {
+	var committed int64
+	for _, vm := range vms {
+		committed += vm.committed()
+	}
+	return committed
+}
+
 func (p *chPool) retryForgets(ctx context.Context) {
 	p.mu.Lock()
 	names := p.forgets
@@ -530,7 +547,8 @@ func (p *chPool) admission(now time.Time, h hostState, probeErr error) string {
 		return probeErr.Error()
 	}
 	hostFull := !p.deniedAt.IsZero() && now.Sub(p.deniedAt) < hostFullHold
-	return admit(p.cfg, h, hostFull, p.manifest.vmMemory().bootBytes, pendingBytes(p.snapshot()))
+	vms := p.snapshot()
+	return admit(p.cfg, h, hostFull, p.manifest.vmMemory().bootBytes, pendingBytes(vms), committedBytes(vms))
 }
 
 // reserve claims an address and a runner name for a VM of s, counted as

@@ -14,26 +14,32 @@ func TestAdmission(t *testing.T) {
 	boot := 2 * gib
 	ok := hostState{load1: 4, cpus: 16, memTotal: 64 * gib, memAvailable: 20 * gib, diskFree: 500 * gib, diskTotal: 1000 * gib}
 	tests := []struct {
-		name    string
-		change  func(*hostState)
-		pending int64
-		want    string
+		name      string
+		change    func(*hostState)
+		pending   int64
+		committed int64
+		want      string
 	}{
-		{"room", func(*hostState) {}, 0, ""},
-		{"load at the limit", func(h *hostState) { h.load1 = 16 }, 0, "load"},
+		{"room", func(*hostState) {}, 0, 0, ""},
+		{"load at the limit", func(h *hostState) { h.load1 = 16 }, 0, 0, "load"},
 		// Reserve is max(10% of 64 GiB, 2 GiB) = 6.4 GiB; 6.4 + 2 boot + 12 pending > 20.
-		{"pending boots count", func(*hostState) {}, 12 * gib, "pending"},
-		{"pending boots that still fit", func(*hostState) {}, 11 * gib / 2, ""},
-		{"percent reserve", func(h *hostState) { h.memAvailable = 8 * gib }, 0, "reserved"},
-		{"exactly enough", func(h *hostState) { h.memAvailable = 64*gib/10 + boot }, 0, ""},
-		{"minimum reserve on a small host", func(h *hostState) { h.memTotal = 8 * gib; h.memAvailable = 4*gib - 1 }, 0, "reserved"},
-		{"disk reserve", func(h *hostState) { h.diskFree = 100 * gib }, 0, "free on the work dir"},
+		{"pending boots count", func(*hostState) {}, 12 * gib, 0, "pending"},
+		{"pending boots that still fit", func(*hostState) {}, 11 * gib / 2, 0, ""},
+		{"percent reserve", func(h *hostState) { h.memAvailable = 8 * gib }, 0, 0, "reserved"},
+		{"exactly enough", func(h *hostState) { h.memAvailable = 64*gib/10 + boot }, 0, 0, ""},
+		{"minimum reserve on a small host", func(h *hostState) { h.memTotal = 8 * gib; h.memAvailable = 4*gib - 1 }, 0, 0, "reserved"},
+		// 64 - 6.4 reserve - 54 committed leaves 3.6 GiB: room for a 2 GiB
+		// boot and its next 1 GiB plug.
+		{"room left by running VMs", func(h *hostState) { h.memAvailable = 60 * gib }, 0, 54 * gib, ""},
+		// Running VMs were given 55 GiB but have not touched it yet.
+		{"memory given to running VMs counts", func(h *hostState) { h.memAvailable = 60 * gib }, 0, 55 * gib, "committed"},
+		{"disk reserve", func(h *hostState) { h.diskFree = 100 * gib }, 0, 0, "free on the work dir"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := ok
 			tt.change(&h)
-			got := admit(chTestConfig(), h, false, boot, tt.pending)
+			got := admit(chTestConfig(), h, false, boot, tt.pending, tt.committed)
 			if (tt.want == "") != (got == "") || !strings.Contains(got, tt.want) {
 				t.Fatalf("admit = %q, want %q", got, tt.want)
 			}
@@ -43,7 +49,7 @@ func TestAdmission(t *testing.T) {
 
 func TestAdmissionClosedWhileGuestsAreDenied(t *testing.T) {
 	h := hostState{load1: 1, cpus: 16, memTotal: 64 * gib, memAvailable: 40 * gib, diskFree: 500 * gib, diskTotal: 1000 * gib}
-	if got := admit(chTestConfig(), h, true, 2*gib, 0); !strings.Contains(got, "denied memory") {
+	if got := admit(chTestConfig(), h, true, 2*gib, 0, 0); !strings.Contains(got, "denied memory") {
 		t.Fatalf("admit = %q", got)
 	}
 }

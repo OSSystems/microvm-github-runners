@@ -44,7 +44,10 @@ A new VM boots only while:
 
 - the 1-minute load average per CPU is below `maxLoadPerCpu`,
 - available host memory, minus the reserve and VMs still booting, covers the
-  boot memory, and
+  boot memory,
+- host memory, minus the reserve and what running VMs were given plus one
+  1 GiB plug each, covers the boot memory and its first plug, so jobs wait in
+  the queue instead of starving running ones, and
 - the `workDir` file system has more free space than its reserve.
 
 The memory reserve is `memReservePercent` (default 10%) of host RAM, at least

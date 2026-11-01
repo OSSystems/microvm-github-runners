@@ -298,6 +298,31 @@ func TestCHBootServesJITAndTearsDown(t *testing.T) {
 	}
 }
 
+// Guests touch memory long after they are given it, so admission charges
+// every VM what it was given and its next plug, not what the host sees used.
+func TestCHAdmissionCountsMemoryGivenToRunningVMs(t *testing.T) {
+	e := newCHTestEnv(t)
+	e.desired(32)
+	// 64 GiB minus the 6.4 GiB reserve fits 19 VMs of 2 GiB plus a 1 GiB
+	// plug each, though the host still shows 60 GiB available.
+	if got := len(e.pool.running); got != 19 {
+		t.Fatalf("runners = %d, want 19 admitted", got)
+	}
+	if e.set.waiting != 13 || !strings.Contains(e.pool.busyReason, "committed") {
+		t.Fatalf("busy %q, waiting %d", e.pool.busyReason, e.set.waiting)
+	}
+	// One VM grew by 2 GiB and another finished: the freed room went to
+	// the growth.
+	e.pool.mu.Lock()
+	vms := e.pool.snapshot()
+	vms[0].memorySnapshot(4 * gib)
+	delete(e.pool.running, vms[1].runner)
+	e.pool.mu.Unlock()
+	if got := e.desired(32); got != 18 {
+		t.Fatalf("runners = %d, want the grown VM to keep the freed slot", got)
+	}
+}
+
 func TestCHAdmissionCountsPendingBoots(t *testing.T) {
 	e := newCHTestEnv(t)
 	// Reserve 6.4 GiB; 13 GiB available leaves room for three 2 GiB boots
