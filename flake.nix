@@ -7,29 +7,20 @@
       url = "github:microvm-nix/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    blueprint = {
+      url = "github:numtide/blueprint";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { nixpkgs, microvm, ... }:
-    let
-      forAllSystems = nixpkgs.lib.genAttrs [
+    inputs:
+    inputs.blueprint {
+      inherit inputs;
+      prefix = "nix/";
+      systems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
-    in
-    {
-      packages = forAllSystems (system: rec {
-        microvm-scaleset = nixpkgs.legacyPackages.${system}.callPackage ./package.nix { };
-        default = microvm-scaleset;
-      });
-
-      nixosModules.default = {
-        imports = [
-          microvm.nixosModules.host
-          ./modules/host.nix
-        ];
-      };
-
-      formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };
 }
