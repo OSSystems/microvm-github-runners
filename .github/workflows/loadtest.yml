@@ -1,0 +1,60 @@
+name: loadtest
+
+on:
+  push:
+    branches: [loadtest]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: octocat-microvm
+    steps:
+      - name: Build Redis from source
+        run: |
+          echo "METRIC nproc=$(nproc)"
+          curl -fsSL https://github.com/redis/redis/archive/refs/tags/7.4.2.tar.gz | tar xz
+          cd redis-7.4.2
+          sed -i 's/REDIS_VERSION "7.4.2"/REDIS_VERSION "7.4.2-loadtest-${{ matrix.n }}"/' src/version.h
+          start=$(date +%s%N)
+          make -j"$(nproc)" BUILD_TLS=no USE_SYSTEMD=no > build.log 2>&1 || { tail -50 build.log; exit 1; }
+          echo "METRIC build_ms=$(( ($(date +%s%N) - start) / 1000000 ))"
+          ./src/redis-server --version
+
+  memory:
+    strategy:
+      fail-fast: false
+      matrix:
+        gib: [1, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 6, 6, 8, 8, 8]
+    runs-on: octocat-microvm
+    steps:
+      - name: Ramp memory to ${{ matrix.gib }} GiB and hold
+        run: |
+          python3 - <<'PY'
+          import mmap, time
+          target, step = ${{ matrix.gib }} << 30, 256 << 20
+          chunks, start = [], time.time()
+          while len(chunks) * step < target:
+              m = mmap.mmap(-1, step)
+              for off in range(0, step, 4096):
+                  m[off] = 1
+              chunks.append(m)
+              time.sleep(max(0, len(chunks) - (time.time() - start)))
+          print(f"METRIC ramp_s={time.time() - start:.1f}")
+          time.sleep(60)
+          PY
+
+  light:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: octocat-microvm
+    steps:
+      - uses: actions/checkout@v6
+      - run: git log --oneline -1 && sleep 15
