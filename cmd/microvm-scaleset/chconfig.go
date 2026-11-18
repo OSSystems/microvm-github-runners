@@ -28,6 +28,13 @@ type chConfig struct {
 	// nested exposes hardware virtualization to the guests, which then get
 	// /dev/kvm.
 	nested bool
+	// memoryStatus is where this controller publishes the memory its VMs
+	// hold, aheadStatus where the pools that come first on the host publish
+	// theirs, and guaranteedMemGiB what runners keep however much those
+	// want.
+	memoryStatus     string
+	aheadStatus      []string
+	guaranteedMemGiB float64
 }
 
 // guestManifest is what the host module tells the controller about the
@@ -131,6 +138,9 @@ func (c config) validateCloudHypervisor() error {
 	}
 	if math.IsNaN(c.ch.memReserveMinGiB) || math.IsInf(c.ch.memReserveMinGiB, 0) || c.ch.memReserveMinGiB < 0 {
 		return errors.New("--mem-reserve-min-gib must be finite and nonnegative")
+	}
+	if math.IsNaN(c.ch.guaranteedMemGiB) || math.IsInf(c.ch.guaranteedMemGiB, 0) || c.ch.guaranteedMemGiB < 0 {
+		return errors.New("--guaranteed-mem-gib must be finite and nonnegative")
 	}
 	if c.maxLoadPerCPU <= 0 || math.IsNaN(c.maxLoadPerCPU) || math.IsInf(c.maxLoadPerCPU, 0) {
 		return errors.New("--max-load-per-cpu must be finite and positive")

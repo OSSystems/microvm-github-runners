@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OSSystems/vmkit-nix/memory"
 	"github.com/actions/scaleset"
 )
 
@@ -565,7 +566,7 @@ func (e *chTestEnv) admissionNow() string {
 	h, err := e.host.state("")
 	e.pool.mu.Lock()
 	defer e.pool.mu.Unlock()
-	return e.pool.admission(time.Now(), h, err)
+	return e.pool.admission(time.Now(), h, err, memory.Ahead{})
 }
 
 // A plug counts as promised from the moment it is decided, not when the
@@ -681,5 +682,82 @@ func TestCHFailedUnplugRetriesAtOnce(t *testing.T) {
 	e.pool.controlMemory(context.Background(), now.Add(time.Second))
 	if e.vms.resized[vm.dir] != 3*gib {
 		t.Fatalf("resized = %v, want the unplug retried at once", e.vms.resized)
+	}
+}
+
+func (e *chTestEnv) admissionWith(ahead memory.Ahead) string {
+	h, err := e.host.state("")
+	e.pool.mu.Lock()
+	defer e.pool.mu.Unlock()
+	return e.pool.admission(time.Now(), h, err, ahead)
+}
+
+// Pools ahead of runners on the host come first: past
+// their guaranteed memory, runners count what those were given and close
+// while one of their VMs was denied memory.
+func TestCHAdmissionLeavesPoolsAheadTheirMemory(t *testing.T) {
+	e := newCHTestEnv(t)
+	now := time.Now()
+	if reason := e.admissionWith(memory.Ahead{}); reason != "" {
+		t.Fatalf("admission without pools ahead: %s", reason)
+	}
+	// 64 GiB less the 6.4 GiB reserve: pools ahead given 55 GiB leave no
+	// room for a 2 GiB boot and its next plug.
+	held := memory.Ahead{Status: memory.Status{UpdatedAt: now, CommittedBytes: 55 * gib}}
+	if reason := e.admissionWith(held); !strings.Contains(reason, "committed") {
+		t.Fatalf("admission next to busy pools ahead = %q", reason)
+	}
+	held.Guaranteed = 4 * gib
+	if reason := e.admissionWith(held); reason != "" {
+		t.Fatalf("admission within the runners' guarantee = %q", reason)
+	}
+	starved := memory.Ahead{Status: memory.Status{UpdatedAt: now, DeniedAt: now.Add(-time.Second)}}
+	if reason := e.admissionWith(starved); !strings.Contains(reason, "ahead of runners") {
+		t.Fatalf("admission while a VM ahead waits for memory = %q", reason)
+	}
+	starved.Status.DeniedAt = now.Add(-hostFullHold - time.Second)
+	if reason := e.admissionWith(starved); reason != "" {
+		t.Fatalf("admission long after a denial = %q", reason)
+	}
+}
+
+// A runner does not grow past its guarantee while a VM ahead of it waits
+// for memory.
+func TestCHPlugYieldsToStarvedPoolsAhead(t *testing.T) {
+	e := newCHTestEnv(t)
+	e.desired(1)
+	vm := e.only(t)
+	now := time.Now()
+	vm.recordStats(guestStats{MemAvailableKiB: 512 << 10, MemTotalKiB: 2 << 20, PSISomeAvg10: 20, ReceivedAt: now.Add(-time.Second)})
+	status := filepath.Join(t.TempDir(), "ahead.json")
+	e.pool.cfg.ch.aheadStatus = []string{status}
+	if err := memory.WriteStatus(status, memory.Status{UpdatedAt: now, DeniedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	e.pool.controlMemory(context.Background(), now)
+	if len(e.vms.resized) != 0 || !vm.denied {
+		t.Fatalf("runner grew while a VM ahead was denied: %v", e.vms.resized)
+	}
+	e.pool.cfg.ch.guaranteedMemGiB = 16
+	vm.mu.Lock()
+	vm.denied = false
+	vm.mu.Unlock()
+	e.pool.controlMemory(context.Background(), now.Add(time.Second))
+	if len(e.vms.resized) != 1 {
+		t.Fatalf("runner within its guarantee did not grow: %v", e.vms.resized)
+	}
+}
+
+func TestCHPublishesRunnerMemory(t *testing.T) {
+	e := newCHTestEnv(t)
+	e.desired(1)
+	status := filepath.Join(t.TempDir(), "memory.json")
+	e.pool.cfg.ch.memoryStatus = status
+	now := time.Now()
+	e.pool.publishMemory(now)
+	s, ok := memory.ReadStatus(status, now)
+	// One VM that has not reported: 2 GiB boot pending, plus its next plug.
+	if !ok || s.PendingBytes != 2*gib || s.CommittedBytes != 3*gib {
+		t.Fatalf("published %+v, %v", s, ok)
 	}
 }

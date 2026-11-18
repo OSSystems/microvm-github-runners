@@ -17,6 +17,12 @@ let
   controlPort = 5001;
   package = pkgs.callPackage ../../../package.nix { vmkit = cfg.vmkitSource; };
   isQemu = cfg.backend == "qemu";
+  # The runners' vmkit memory pool, and the status files of the pools that
+  # come first on the host.
+  poolName = "microvm-github-runners";
+  ahead = lib.mapAttrsToList (_: p: p.statusFile) (
+    lib.filterAttrs (_: p: p.rank == "first") config.services.vmkit.memory.pools
+  );
   commonFlags = map (url: "--url=${url}") cfg.urls ++ [
     "--name=${cfg.name}"
     "--labels=${lib.concatStringsSep "," cfg.labels}"
@@ -272,7 +278,8 @@ in
     };
     memReservePercent = lib.mkOption {
       type = lib.types.ints.between 0 99;
-      default = 10;
+      default = config.services.vmkit.memory.reservePercent;
+      defaultText = lib.literalExpression "config.services.vmkit.memory.reservePercent";
       description = ''
         cloud-hypervisor only. Share of host memory, at least 2 GiB, left to
         the host: no VM boots and no VM grows into it.
@@ -286,6 +293,16 @@ in
         /dev/kvm, so jobs can boot VMs of their own, e.g. NixOS VM tests run
         inside the job rather than through the host's Nix daemon. Off, the
         guests see no virtualization extensions.
+      '';
+    };
+    guaranteedMemGiB = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        cloud-hypervisor only, with a `first` pool in
+        `services.vmkit.memory.pools` on the same host: runners only boot into
+        and grow into memory first pools leave, except for this much, which
+        runners may hold whatever they want.
       '';
     };
     diskReservePercent = lib.mkOption {
@@ -495,6 +512,11 @@ in
       })
 
       (lib.mkIf (!isQemu) {
+        services.vmkit.memory.pools.${poolName} = {
+          rank = "yielding";
+          guaranteedGiB = cfg.guaranteedMemGiB;
+        };
+
         assertions = [
           {
             assertion = qemuOnlySet == [ ];
@@ -538,6 +560,13 @@ in
                 "--control-port=${toString controlPort}"
               ]
               ++ lib.optional cfg.nestedVirtualization "--nested-virtualization"
+              ++ lib.optionals (ahead != [ ]) (
+                [
+                  "--memory-status=${config.services.vmkit.memory.pools.${poolName}.statusFile}"
+                  "--guaranteed-mem-gib=${toString cfg.guaranteedMemGiB}"
+                ]
+                ++ map (f: "--ahead-status=${f}") ahead
+              )
             );
           };
           tmpfiles.rules = [ "d ${cfg.workDir} 0750 root kvm -" ];

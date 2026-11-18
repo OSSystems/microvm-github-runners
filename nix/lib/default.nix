@@ -1,7 +1,13 @@
 { flake, inputs, ... }:
-{
+rec {
   hostConfig =
     system: backend: extra:
+    hostConfigWith system backend extra { };
+
+  # hostConfigWith also takes a NixOS module, for what lives outside
+  # services.microvm-github-runners.
+  hostConfigWith =
+    system: backend: extra: module:
     (inputs.nixpkgs.lib.nixosSystem {
       inherit system;
       modules = [
@@ -29,6 +35,7 @@
           }
           // extra;
         }
+        module
       ];
     }).config;
 }

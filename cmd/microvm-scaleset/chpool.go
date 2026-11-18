@@ -21,6 +21,7 @@ import (
 	"github.com/actions/scaleset"
 
 	"github.com/OSSystems/vmkit-nix/ch"
+	"github.com/OSSystems/vmkit-nix/memory"
 )
 
 const (
@@ -487,9 +488,10 @@ func (p *chPool) reconcile(ctx context.Context) {
 	for failed := false; ; {
 		h, probeErr := p.host.state(p.cfg.ch.workDir)
 		now := time.Now()
+		ahead := p.ahead(now)
 		p.mu.Lock()
 		running := p.counts()
-		reason := p.admission(now, h, probeErr)
+		reason := p.admission(now, h, probeErr, ahead)
 		var set *scaleSet
 		if reason == "" && !failed {
 			set = nextWaiting(p.sets, &p.next, running)
@@ -538,7 +540,7 @@ func (p *chPool) noteBusy(reason string, running map[*scaleSet]int) {
 
 // admission decides from a host probe taken without the lock whether a VM
 // may boot at now. The caller holds p.mu.
-func (p *chPool) admission(now time.Time, h hostState, probeErr error) string {
+func (p *chPool) admission(now time.Time, h hostState, probeErr error, ahead memory.Ahead) string {
 	if len(p.running) >= p.addrs.size() {
 		return "every address is in use"
 	}
@@ -547,7 +549,42 @@ func (p *chPool) admission(now time.Time, h hostState, probeErr error) string {
 	}
 	hostFull := !p.deniedAt.IsZero() && now.Sub(p.deniedAt) < hostFullHold
 	vms := p.snapshot()
-	return admit(p.cfg, h, hostFull, p.manifest.vmMemory().BootBytes, pendingBytes(vms), committedBytes(vms))
+	boot := p.manifest.vmMemory().BootBytes
+	pending, committed := pendingBytes(vms), committedBytes(vms)
+	if ahead.Yields(committed + boot + memoryStep) {
+		if ahead.Starved(now) {
+			return "a VM ahead of runners was denied memory"
+		}
+		pending += ahead.Status.PendingBytes
+		committed += ahead.Status.CommittedBytes
+	}
+	return admit(p.cfg, h, hostFull, boot, pending, committed)
+}
+
+// ahead reads what the pools that come first on the host hold; read
+// without p.mu.
+func (p *chPool) ahead(now time.Time) memory.Ahead {
+	return memory.Ahead{
+		Status:     memory.ReadStatuses(p.cfg.ch.aheadStatus, now),
+		Guaranteed: int64(p.cfg.ch.guaranteedMemGiB * float64(gib)),
+	}
+}
+
+// publishMemory tells the pools ahead of runners what runners hold.
+func (p *chPool) publishMemory(now time.Time) {
+	if p.cfg.ch.memoryStatus == "" {
+		return
+	}
+	p.mu.Lock()
+	vms := p.snapshot()
+	p.mu.Unlock()
+	s := memory.Status{UpdatedAt: now, CommittedBytes: committedBytes(vms), PendingBytes: pendingBytes(vms)}
+	p.mu.Lock()
+	s.DeniedAt = p.deniedAt
+	p.mu.Unlock()
+	if err := memory.WriteStatus(p.cfg.ch.memoryStatus, s); err != nil {
+		p.logger.Warn("publishing runner memory", "error", err)
+	}
 }
 
 // reserve claims an address and a runner name for a VM of s, counted as
@@ -703,6 +740,7 @@ func (p *chPool) background(ctx context.Context) {
 			return
 		case <-tick.C:
 			p.controlMemory(ctx, time.Now())
+			p.publishMemory(time.Now())
 		}
 	}
 }
@@ -714,6 +752,7 @@ func (p *chPool) controlMemory(ctx context.Context, now time.Time) {
 	p.mu.Lock()
 	vms := p.snapshot()
 	p.mu.Unlock()
+	ahead := p.ahead(now)
 	for _, vm := range vms {
 		actual, err := p.vms.memory(ctx, vm.dir)
 		if err != nil || actual <= 0 {
@@ -731,7 +770,15 @@ func (p *chPool) controlMemory(ctx context.Context, now time.Time) {
 			continue
 		}
 		m := vm.memorySnapshot(actual)
-		action, target := memoryDecision(m, hostMemory{Available: h.memAvailable, Reserve: memoryReserve(p.cfg, h.memTotal), Pending: pendingBytes(p.snapshot())}, now)
+		host := hostMemory{Available: h.memAvailable, Reserve: memoryReserve(p.cfg, h.memTotal), Pending: pendingBytes(p.snapshot())}
+		beyond := ahead.Yields(committedBytes(p.snapshot()))
+		if beyond {
+			host.Pending += ahead.Status.PendingBytes
+		}
+		action, target := memoryDecision(m, host, now)
+		if action == memoryPlug && beyond && ahead.Starved(now) {
+			action, target = memoryDenied, actual
+		}
 		var undo func()
 		firstDenial := false
 		switch action {
