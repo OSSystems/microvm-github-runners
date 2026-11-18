@@ -28,7 +28,7 @@ func TestVMSpecDryRun(t *testing.T) {
 		"--kernel", "/nix/store/kernel/bzImage",
 		"--initramfs", "/nix/store/initrd/initrd",
 		"--cmdline", "console=ttyS0 init=/nix/store/system/init ghr.name=ci-12-0123abcd ghr.addr=10.231.0.12/24 ghr.gw=10.231.0.1",
-		"--cpus", "boot=16,max=16",
+		"--cpus", "boot=16,max=16,nested=on",
 		"--memory", "size=2048M,hotplug_method=virtio-mem,hotplug_size=1048576M,shared=on",
 		"--balloon", "free_page_reporting=on",
 		"--disk", "path=" + dir + "/disk.img,direct=on,image_type=raw",

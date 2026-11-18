@@ -11,7 +11,6 @@ import (
 	"time"
 )
 
-const gib int64 = 1 << 30
 const balloonPath = "/machine/peripheral/balloon0"
 
 type qmpClient struct {

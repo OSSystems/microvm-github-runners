@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+
+	"github.com/OSSystems/vmkit-nix/ch"
 )
 
 const (
@@ -107,7 +109,7 @@ func (vm *chVM) takeJITConfig() (string, func(bool), error) {
 func (vm *chVM) recordStats(s guestStats) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	vm.mem.observe(s)
+	vm.mem.Observe(s)
 }
 
 // pending is memory this VM was promised but has not been seen to take: its
@@ -116,10 +118,7 @@ func (vm *chVM) recordStats(s guestStats) {
 func (vm *chVM) pending() int64 {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	if vm.mem.stats.ReceivedAt.IsZero() {
-		return vm.mem.bootBytes
-	}
-	return vm.mem.pendingPlug
+	return vm.mem.Pending()
 }
 
 // committed is what this VM was given, boot plus plugged plus a plug in
@@ -127,14 +126,14 @@ func (vm *chVM) pending() int64 {
 func (vm *chVM) committed() int64 {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	return vm.mem.actualBytes + vm.mem.pendingPlug + memoryStep
+	return vm.mem.Committed()
 }
 
 // memorySnapshot updates the VM's actual size and returns its memory state.
 func (vm *chVM) memorySnapshot(actual int64) vmMemory {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	vm.mem.actualBytes = actual
+	vm.mem.ActualBytes = actual
 	return vm.mem
 }
 
@@ -143,15 +142,15 @@ func (vm *chVM) memorySnapshot(actual int64) vmMemory {
 func (vm *chVM) grantResize(actual, target int64, at time.Time) (undo func()) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	previous, wasDenied := vm.mem.grant(actual, target, at), vm.denied
+	previous, wasDenied := vm.mem.Grant(actual, target, at), vm.denied
 	vm.denied = false
 	return func() {
 		vm.mu.Lock()
 		defer vm.mu.Unlock()
 		// Everything but what was observed since goes back.
-		stats, actual := vm.mem.stats, vm.mem.actualBytes
+		stats, actual := vm.mem.Stats, vm.mem.ActualBytes
 		vm.mem, vm.denied = previous, wasDenied
-		vm.mem.stats, vm.mem.actualBytes = stats, actual
+		vm.mem.Stats, vm.mem.ActualBytes = stats, actual
 	}
 }
 
@@ -160,7 +159,7 @@ func (vm *chVM) grantResize(actual, target int64, at time.Time) (undo func()) {
 func (vm *chVM) resizeDone(at time.Time) {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
-	vm.mem.resizedAt = at
+	vm.mem.ResizedAt = at
 }
 
 // markDenied notes a denied plug and reports whether it is the first in a
@@ -190,9 +189,9 @@ func (vm *chVM) expired(now time.Time) string {
 	switch {
 	case vm.jitState != jitServed && now.Sub(vm.startedAt) > jitTimeout:
 		return "runner did not fetch its JIT config"
-	case vm.mem.stats.ReceivedAt.IsZero() && now.Sub(vm.startedAt) > jitTimeout:
+	case vm.mem.Stats.ReceivedAt.IsZero() && now.Sub(vm.startedAt) > jitTimeout:
 		return "guest never reported"
-	case !vm.mem.stats.ReceivedAt.IsZero() && now.Sub(vm.mem.stats.ReceivedAt) > statsTimeout:
+	case !vm.mem.Stats.ReceivedAt.IsZero() && now.Sub(vm.mem.Stats.ReceivedAt) > statsTimeout:
 		return "guest stopped reporting"
 	case !vm.completedAt.IsZero() && now.Sub(vm.completedAt) > jobEndGrace:
 		return "VM still up after its job completed"
@@ -548,7 +547,7 @@ func (p *chPool) admission(now time.Time, h hostState, probeErr error) string {
 	}
 	hostFull := !p.deniedAt.IsZero() && now.Sub(p.deniedAt) < hostFullHold
 	vms := p.snapshot()
-	return admit(p.cfg, h, hostFull, p.manifest.vmMemory().bootBytes, pendingBytes(vms), committedBytes(vms))
+	return admit(p.cfg, h, hostFull, p.manifest.vmMemory().BootBytes, pendingBytes(vms), committedBytes(vms))
 }
 
 // reserve claims an address and a runner name for a VM of s, counted as
@@ -601,7 +600,7 @@ func (p *chPool) boot(ctx context.Context, vm *chVM) error {
 // empty disk, its tap and the control socket, all usable by the VM user, and
 // the spec its supervisor reads.
 func (p *chPool) prepare(vm *chVM, spec vmSpec) error {
-	uid, gid := p.account.uid, p.account.gid
+	uid, gid := p.account.UID, p.account.GID
 	if err := os.Mkdir(vm.dir, 0700); err != nil {
 		return err
 	}
@@ -670,7 +669,7 @@ func (p *chPool) teardown(ctx context.Context, vm *chVM) error {
 		p.logger.Warn("runner cleanup deferred", "runner", vm.runner, "error", forgetErr)
 	}
 	vm.mu.Lock()
-	p.logger.Info("runner finished", "runner", vm.runner, "org", vm.set.org, "lifetime", time.Since(vm.startedAt).Round(time.Second), "memoryGiB", float64(vm.mem.actualBytes)/float64(gib), "jitServed", vm.jitState == jitServed)
+	p.logger.Info("runner finished", "runner", vm.runner, "org", vm.set.org, "lifetime", time.Since(vm.startedAt).Round(time.Second), "memoryGiB", float64(vm.mem.ActualBytes)/float64(gib), "jitServed", vm.jitState == jitServed)
 	vm.mu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -732,7 +731,7 @@ func (p *chPool) controlMemory(ctx context.Context, now time.Time) {
 			continue
 		}
 		m := vm.memorySnapshot(actual)
-		action, target := memoryDecision(m, hostMemory{available: h.memAvailable, reserve: memoryReserve(p.cfg, h.memTotal), pending: pendingBytes(p.snapshot())}, now)
+		action, target := memoryDecision(m, hostMemory{Available: h.memAvailable, Reserve: memoryReserve(p.cfg, h.memTotal), Pending: pendingBytes(p.snapshot())}, now)
 		var undo func()
 		firstDenial := false
 		switch action {
@@ -755,7 +754,7 @@ func (p *chPool) controlMemory(ctx context.Context, now time.Time) {
 			continue
 		}
 		vm.resizeDone(latest(now, time.Now()))
-		p.logger.Info("guest memory changed", "runner", vm.runner, "action", action.String(), "fromGiB", float64(actual)/float64(gib), "toGiB", float64(target)/float64(gib), "guestAvailableGiB", float64(m.stats.available())/float64(gib), "psiSome", m.stats.PSISomeAvg10)
+		p.logger.Info("guest memory changed", "runner", vm.runner, "action", action.String(), "fromGiB", float64(actual)/float64(gib), "toGiB", float64(target)/float64(gib), "guestAvailableGiB", float64(m.Stats.Available())/float64(gib), "psiSome", m.Stats.PSISomeAvg10)
 	}
 }
 
@@ -809,12 +808,12 @@ func (systemdVMs) units(ctx context.Context, glob string) ([]string, error) {
 }
 
 func (systemdVMs) memory(ctx context.Context, dir string) (int64, error) {
-	info, err := newCHClient(apiSocket(dir)).info(ctx)
+	info, err := ch.NewClient(apiSocket(dir)).Info(ctx)
 	return info.MemoryActualSize, err
 }
 
 func (systemdVMs) resize(ctx context.Context, dir string, desired int64) error {
-	return newCHClient(apiSocket(dir)).resizeMemory(ctx, desired)
+	return ch.NewClient(apiSocket(dir)).ResizeMemory(ctx, desired)
 }
 
 // procHost reads /proc and the work dir's file system.

@@ -211,7 +211,7 @@ func newCHTestEnv(t *testing.T) *chTestEnv {
 		logger:   logger,
 		manifest: testManifest(),
 		addrs:    newAddressPool([3]byte{10, 231, 0}),
-		account:  account{uid: os.Getuid(), gid: os.Getgid()},
+		account:  account{UID: os.Getuid(), GID: os.Getgid()},
 		self:     "/bin/microvm-scaleset",
 		cpus:     16,
 		vms:      e.vms,
@@ -457,7 +457,7 @@ func TestCHWatchdogStopsStuckVMs(t *testing.T) {
 		{"reporting", func(vm *chVM) {
 			vm.jitState = jitServed
 			vm.startedAt = time.Now().Add(-time.Hour)
-			vm.mem.stats.ReceivedAt = time.Now().Add(-time.Second)
+			vm.mem.Stats.ReceivedAt = time.Now().Add(-time.Second)
 		}, false},
 		{"fetched its JIT config, not reporting yet", func(vm *chVM) {
 			vm.jitState = jitServed
@@ -469,7 +469,7 @@ func TestCHWatchdogStopsStuckVMs(t *testing.T) {
 		}, true},
 		{"stopped reporting", func(vm *chVM) {
 			vm.jitState = jitServed
-			vm.mem.stats.ReceivedAt = time.Now().Add(-statsTimeout - time.Second)
+			vm.mem.Stats.ReceivedAt = time.Now().Add(-statsTimeout - time.Second)
 		}, true},
 		{"just finished its job", func(vm *chVM) {
 			vm.jitState = jitServed

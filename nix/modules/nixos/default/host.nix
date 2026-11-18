@@ -15,7 +15,7 @@ let
   hostAddress = "${cfg.network.subnet}.1";
   nixDaemonPort = 5000;
   controlPort = 5001;
-  package = pkgs.callPackage ../../../package.nix { };
+  package = pkgs.callPackage ../../../package.nix { vmkit = cfg.vmkitSource; };
   isQemu = cfg.backend == "qemu";
   commonFlags = map (url: "--url=${url}") cfg.urls ++ [
     "--name=${cfg.name}"
@@ -354,6 +354,11 @@ in
       default = { };
     };
 
+    vmkitSource = lib.mkOption {
+      type = lib.types.path;
+      internal = true;
+      description = "vmkit's source, which microvm-scaleset builds against; `nixosModules.default` sets it.";
+    };
     microvmGuestModule = lib.mkOption {
       type = lib.types.nullOr lib.types.raw;
       default = null;
@@ -528,6 +533,15 @@ in
       })
 
       {
+        # VMs reach the internet, nothing on the host or private networks.
+        services.vmkit = {
+          inherit (cfg.network) externalInterface;
+          networks.microvm = {
+            inherit (cfg.network) subnet;
+            interface = cfg.network.bridge;
+          };
+        };
+
         assertions = [
           {
             assertion = cfg.name != "";
@@ -590,32 +604,6 @@ in
             "interface-name:${cfg.network.bridge}"
             "interface-name:ghrunner*"
           ];
-          nat = {
-            enable = true;
-            internalInterfaces = [ cfg.network.bridge ];
-            inherit (cfg.network) externalInterface;
-          };
-          # VMs reach the internet, nothing on the host or private networks.
-          firewall = {
-            extraCommands = ''
-              iptables -N microvm-in 2>/dev/null || iptables -F microvm-in
-              iptables -A microvm-in -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-              iptables -A microvm-in -j DROP
-              iptables -D INPUT -i ${cfg.network.bridge} -j microvm-in 2>/dev/null || true
-              iptables -I INPUT -i ${cfg.network.bridge} -j microvm-in
-
-              iptables -N microvm-fwd 2>/dev/null || iptables -F microvm-fwd
-              for net in 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16; do
-                iptables -A microvm-fwd -d "$net" -j DROP
-              done
-              iptables -D FORWARD -i ${cfg.network.bridge} -j microvm-fwd 2>/dev/null || true
-              iptables -I FORWARD -i ${cfg.network.bridge} -j microvm-fwd
-            '';
-            extraStopCommands = ''
-              iptables -D INPUT -i ${cfg.network.bridge} -j microvm-in 2>/dev/null || true
-              iptables -D FORWARD -i ${cfg.network.bridge} -j microvm-fwd 2>/dev/null || true
-            '';
-          };
         };
       }
     ]

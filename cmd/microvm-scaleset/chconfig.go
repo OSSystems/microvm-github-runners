@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/OSSystems/vmkit-nix/memory"
 )
 
 // chConfig holds the settings only the cloud-hypervisor backend uses.
@@ -74,7 +76,7 @@ func parseGuestManifest(raw []byte) (guestManifest, error) {
 // vmMemory is a new VM's memory: the boot size, growing up to boot plus
 // hotplug size.
 func (m guestManifest) vmMemory() vmMemory {
-	return vmMemory{bootBytes: m.BootMemMiB * mib, maxBytes: (m.BootMemMiB + m.HotplugMemMiB) * mib, actualBytes: m.BootMemMiB * mib}
+	return memory.NewVMMemory(m.BootMemMiB*mib, (m.BootMemMiB+m.HotplugMemMiB)*mib)
 }
 
 // subnetPrefix returns the three octets of --subnet.

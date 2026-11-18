@@ -1,8 +1,9 @@
-module github.com/OSSystems/microvm-github-runners/cmd/microvm-scaleset
+module github.com/OSSystems/microvm-github-runners
 
 go 1.25.3
 
 require (
+	github.com/OSSystems/vmkit-nix v0.1.1
 	github.com/actions/scaleset v0.4.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 )

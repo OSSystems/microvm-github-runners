@@ -5,8 +5,11 @@ throwaway microVM**, and the number of VMs follows the host's spare CPU and
 memory.
 
 Built on [cloud-hypervisor](https://www.cloudhypervisor.org/),
+[vmkit-nix](https://github.com/OSSystems/vmkit-nix),
 [microvm.nix](https://github.com/microvm-nix/microvm.nix) and the
 [actions/scaleset](https://github.com/actions/scaleset) client. No Kubernetes.
+vmkit holds what runners share with other VMs on the host: the
+cloud-hypervisor plumbing, guest network isolation and memory accounting.
 
 ## Why
 

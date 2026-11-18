@@ -1,3 +1,5 @@
+github.com/OSSystems/vmkit-nix v0.1.1 h1:+OdoIGXwtIAdiwiuL6ryDDRNrat+1Bde9sQk+xkldoU=
+github.com/OSSystems/vmkit-nix v0.1.1/go.mod h1:VNhGT0RE3jOGe3mRhDvrXFxTUMDTuyaop6V2uZkEI54=
 github.com/actions/scaleset v0.4.0 h1:691GC2AkHb3ZGjfNvatboYoRS7CLr3+4VcZk/6w9IbM=
 github.com/actions/scaleset v0.4.0/go.mod h1:2L2I6rggFWV+zprDet6y7y7Vkm3HPudaup78eSc79Uo=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1VwoXQT9A3Wy9MM3WgvqSxFWenqJduM=

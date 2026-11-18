@@ -8,7 +8,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -22,10 +21,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -658,70 +655,18 @@ func removeRunner(ctx context.Context, client runnerClient, name string) error {
 	return client.RemoveRunner(lookupCtx, int64(runner.ID))
 }
 
-// account is a user and the groups it runs with.
-type account struct {
-	uid, gid int
-	groups   []uint32
-}
-
-func lookupAccount(name string) (account, error) {
-	u, err := user.Lookup(name)
-	if err != nil {
-		return account{}, err
-	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return account{}, err
-	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return account{}, err
-	}
-	a := account{uid: uid, gid: gid}
-	ids, err := u.GroupIds()
-	if err != nil {
-		return a, err
-	}
-	for _, id := range ids {
-		if n, err := strconv.Atoi(id); err == nil {
-			a.groups = append(a.groups, uint32(n))
-		}
-	}
-	return a, nil
-}
-
 func chown(path, owner string) error {
 	a, err := lookupAccount(owner)
 	if err != nil {
 		return err
 	}
-	return os.Chown(path, a.uid, a.gid)
+	return os.Chown(path, a.UID, a.GID)
 }
 
 // vmRunning reports whether the slot's VM is running.
 func vmRunning(slot string) bool {
 	running, err := unitRunning(context.Background(), "microvm@"+slot+".service")
 	return running || err != nil
-}
-
-// unitRunning reports whether a unit is up or has a start job queued.
-func unitRunning(ctx context.Context, unit string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", unit).Output()
-	if err != nil {
-		return true, err
-	}
-	switch strings.TrimSpace(string(out)) {
-	case "active", "activating", "deactivating":
-		return true, nil
-	}
-	job, err := exec.CommandContext(ctx, "systemctl", "show", "--property=Job", "--value", unit).Output()
-	if err != nil {
-		return true, err
-	}
-	value := strings.TrimSpace(string(job))
-	return value != "" && value != "0" && value != "[0 /]", nil
 }
 
 // room returns how many more VMs fit next to the running ones, or 0 and why
@@ -770,38 +715,6 @@ func (p *pool) memoryRoom(running int, mem map[string]float64) (int, string) {
 		return 0, fmt.Sprintf("%.1f GiB available, %.1f GiB reserved for VM growth", mem["MemAvailable"], growth)
 	}
 	return min(n, availableSlots), ""
-}
-
-// load1 returns the 1-minute load average.
-func load1() (float64, error) {
-	raw, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return 0, err
-	}
-	fields := strings.Fields(string(raw))
-	if len(fields) == 0 {
-		return 0, errors.New("empty /proc/loadavg")
-	}
-	return strconv.ParseFloat(fields[0], 64)
-}
-
-// meminfoKiB returns the fields of /proc/meminfo, in KiB.
-func meminfoKiB() (map[string]int64, error) {
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	mem := map[string]int64{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 {
-			kib, _ := strconv.ParseInt(fields[1], 10, 64)
-			mem[strings.TrimSuffix(fields[0], ":")] = kib
-		}
-	}
-	return mem, sc.Err()
 }
 
 // meminfoGiB returns the fields of /proc/meminfo, in GiB.
