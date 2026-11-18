@@ -41,6 +41,11 @@ in
         }
       )
     // {
+      kvm = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        internal = true;
+      };
       controlRequests = lib.mkOption {
         type = lib.types.raw;
         readOnly = true;
@@ -68,7 +73,14 @@ in
       "memory_hotplug.memmap_on_memory=1"
       "psi=1"
     ];
-    boot.kernelModules = [ "virtio_mem" ];
+    boot.kernelModules = [
+      "virtio_mem"
+    ]
+    ++ lib.optionals cfg.kvm [
+      "kvm-amd"
+      "kvm-intel"
+    ];
+    users.users.runner.extraGroups = lib.mkIf cfg.kvm [ "kvm" ];
     services.udev.extraRules = ''
       SUBSYSTEM=="cpu", ATTR{online}=="0", ATTR{online}="1"
     '';

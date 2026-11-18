@@ -9,6 +9,8 @@ let
   inherit (flake.lib) hostConfig;
   ch = hostConfig system "cloud-hypervisor" { };
   qemu = hostConfig system "qemu" { poolSize = 2; };
+  nested = hostConfig system "cloud-hypervisor" { nestedVirtualization = true; };
+  nestedGuest = nested.services.microvm-github-runners.guestConfig;
   guest = ch.services.microvm-github-runners.guestConfig;
   cfg = guest.microvm-github-runner;
   params = guest.microvm.kernelParams;
@@ -76,6 +78,15 @@ let
     {
       ok = (services.runner-identity.unitConfig.FailureAction or null) == "poweroff";
       msg = "a VM without identity must power off";
+    }
+    {
+      ok =
+        !lib.hasInfix "--nested-virtualization" ch.systemd.services.microvm-scaleset.serviceConfig.ExecStart
+        && !lib.elem "kvm" guest.users.users.runner.extraGroups
+        && lib.hasInfix "--nested-virtualization" nested.systemd.services.microvm-scaleset.serviceConfig.ExecStart
+        && lib.elem "kvm" nestedGuest.users.users.runner.extraGroups
+        && lib.elem "kvm-amd" nestedGuest.boot.kernelModules;
+      msg = "runner VMs get /dev/kvm only with nestedVirtualization";
     }
     {
       ok =

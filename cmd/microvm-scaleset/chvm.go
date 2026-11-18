@@ -15,6 +15,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/OSSystems/vmkit-nix/ch"
+	"github.com/OSSystems/vmkit-nix/virtiofs"
 )
 
 const nixDaemonSocket = "/nix/var/nix/daemon-socket/socket"
@@ -40,7 +43,7 @@ type vmFsDaemon struct {
 func vsockSocket(dir string) string { return filepath.Join(dir, "vsock.sock") }
 
 func vsockPortSocket(dir string, port int) string {
-	return fmt.Sprintf("%s_%d", vsockSocket(dir), port)
+	return ch.GuestPortSocket(vsockSocket(dir), port)
 }
 
 func apiSocket(dir string) string { return filepath.Join(dir, "api.sock") }
@@ -60,32 +63,28 @@ func buildVMSpec(c config, m guestManifest, runner string, addr vmAddress, cpus 
 		NixSocket: vsockPortSocket(dir, c.ch.nixDaemonPort),
 		NixTarget: nixDaemonSocket,
 	}
-	cmdline := strings.TrimSpace(m.Cmdline + " ghr.name=" + runner + " ghr.addr=" + addr.ip() + "/24 ghr.gw=" + addr.gateway())
-	ch := []string{m.CloudHypervisor,
-		"--api-socket", "path=" + apiSocket(dir),
-		"--kernel", m.Kernel,
-		"--initramfs", m.Initrd,
-		"--cmdline", cmdline,
-		"--cpus", fmt.Sprintf("boot=%d,max=%d", cpus, cpus),
-		"--memory", fmt.Sprintf("size=%dM,hotplug_method=virtio-mem,hotplug_size=%dM,shared=on", m.BootMemMiB, m.HotplugMemMiB),
-		"--balloon", "free_page_reporting=on",
-		"--disk", "path=" + diskImage(dir) + ",direct=on,image_type=raw",
-		"--net", "tap=" + addr.tap() + ",mac=" + addr.mac(),
-		"--vsock", fmt.Sprintf("cid=%d,socket=%s", addr.cid(), vsockSocket(dir)),
-		"--serial", "tty",
-		"--console", "off",
+	vm := ch.VM{
+		Binary:      m.CloudHypervisor,
+		APISocket:   apiSocket(dir),
+		Kernel:      m.Kernel,
+		Initramfs:   m.Initrd,
+		Cmdline:     strings.TrimSpace(m.Cmdline + " ghr.name=" + runner + " ghr.addr=" + addr.ip() + "/24 ghr.gw=" + addr.gateway()),
+		CPUs:        cpus,
+		Nested:      c.ch.nested,
+		MemoryMiB:   m.BootMemMiB,
+		HotplugMiB:  m.HotplugMemMiB,
+		Disks:       []ch.Disk{{Path: diskImage(dir), Direct: true}},
+		Nets:        []ch.Net{{Tap: addr.tap(), MAC: addr.mac()}},
+		VsockCID:    uint32(addr.cid()),
+		VsockSocket: vsockSocket(dir),
+		Serial:      "tty",
 	}
 	for _, share := range m.Shares {
 		socket := filepath.Join(dir, "fs-"+share.Tag+".sock")
-		spec.Virtiofsd = append(spec.Virtiofsd, vmFsDaemon{Socket: socket, Argv: []string{m.Virtiofsd,
-			"--socket-path=" + socket,
-			"--shared-dir=" + share.Source,
-			"--readonly",
-			"--cache=auto",
-		}})
-		ch = append(ch, "--fs", "tag="+share.Tag+",socket="+socket)
+		spec.Virtiofsd = append(spec.Virtiofsd, vmFsDaemon{Socket: socket, Argv: append([]string{m.Virtiofsd}, virtiofs.Args(socket, share.Source)...)})
+		vm.Shares = append(vm.Shares, ch.Share{Tag: share.Tag, Socket: socket})
 	}
-	spec.CloudHypervisor = ch
+	spec.CloudHypervisor = vm.Args()
 	return spec
 }
 
@@ -112,10 +111,6 @@ func systemdRunArgv(unit, self, specPath string) []string {
 		"--",
 		self, "vm", "--spec=" + specPath,
 	}
-}
-
-func (a account) credential() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(a.uid), Gid: uint32(a.gid), Groups: a.groups}, Pdeathsig: syscall.SIGTERM}
 }
 
 // runVM is the main process of a VM's unit: virtiofsd per share (root), the
@@ -172,7 +167,7 @@ func runVM(args []string) error {
 		if err := waitForSocket(fs.Socket, 10*time.Second); err != nil {
 			return err
 		}
-		if err := os.Chown(fs.Socket, vmAccount.uid, vmAccount.gid); err != nil {
+		if err := os.Chown(fs.Socket, vmAccount.UID, vmAccount.GID); err != nil {
 			return err
 		}
 	}
@@ -183,7 +178,7 @@ func runVM(args []string) error {
 		return err
 	}
 	ln.SetUnlinkOnClose(false)
-	if err := os.Chown(spec.NixSocket, vmAccount.uid, vmAccount.gid); err != nil {
+	if err := os.Chown(spec.NixSocket, vmAccount.UID, vmAccount.GID); err != nil {
 		return err
 	}
 	if err := os.Chmod(spec.NixSocket, 0600); err != nil {
@@ -200,7 +195,7 @@ func runVM(args []string) error {
 	}
 	proxy := exec.Command(self, "nix-proxy", "--target="+spec.NixTarget)
 	proxy.ExtraFiles = []*os.File{lnFile}
-	proxy.SysProcAttr = nixAccount.credential()
+	proxy.SysProcAttr = nixAccount.Credential()
 	err = start(proxy, "nix-proxy")
 	lnFile.Close()
 	if err != nil {
@@ -208,7 +203,7 @@ func runVM(args []string) error {
 	}
 
 	ch := exec.Command(spec.CloudHypervisor[0], spec.CloudHypervisor[1:]...)
-	ch.SysProcAttr = vmAccount.credential()
+	ch.SysProcAttr = vmAccount.Credential()
 	ch.Stdout, ch.Stderr = os.Stdout, os.Stderr
 	ch.Dir = spec.Dir
 	if err := ch.Start(); err != nil {
@@ -228,19 +223,6 @@ func runVM(args []string) error {
 		case <-signals:
 			ch.Process.Signal(syscall.SIGTERM)
 		}
-	}
-}
-
-func waitForSocket(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		if fi, err := os.Stat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s did not appear", path)
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 

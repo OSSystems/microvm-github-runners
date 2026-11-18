@@ -62,7 +62,8 @@
       "inputs": {
         "blueprint": "blueprint",
         "microvm": "microvm",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "vmkit": "vmkit"
       }
     },
     "spectrum": {
@@ -93,6 +94,29 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "vmkit": {
+      "inputs": {
+        "blueprint": [
+          "blueprint"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1795029729,
+        "narHash": "sha256-PC9TumG4844UdPZgr80+ckBYOyoBhZB1tR+2FnE7d34=",
+        "owner": "OSSystems",
+        "repo": "vmkit-nix",
+        "rev": "fa0854c596db726bc166ac05d03418229cf91453",
+        "type": "github"
+      },
+      "original": {
+        "owner": "OSSystems",
+        "repo": "vmkit-nix",
         "type": "github"
       }
     }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -30,22 +29,6 @@ type runnerIdentity struct {
 	AgentID    json.Number `json:"AgentId"`
 	AgentName  string      `json:"AgentName"`
 	ScaleSetID json.Number `json:"RunnerScaleSetId"`
-}
-
-func readBounded(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) > limit {
-		return nil, errors.New("file exceeds size limit")
-	}
-	return b, nil
 }
 
 func readRunnerIdentity(path string) (runnerIdentity, error) {
@@ -76,37 +59,6 @@ func readRunnerIdentity(path string) (runnerIdentity, error) {
 		return r, errors.New("incomplete runner identity")
 	}
 	return r, nil
-}
-
-func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err = f.Chmod(mode); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(tmp, path); err != nil {
-		return err
-	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
 }
 
 func (p *pool) writeOwner(slot string, r ownerRecord) error {

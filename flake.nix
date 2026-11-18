@@ -7,6 +7,11 @@
       url = "github:microvm-nix/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    vmkit = {
+      url = "github:OSSystems/vmkit-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.blueprint.follows = "blueprint";
+    };
     blueprint = {
       url = "github:numtide/blueprint";
       inputs.nixpkgs.follows = "nixpkgs";

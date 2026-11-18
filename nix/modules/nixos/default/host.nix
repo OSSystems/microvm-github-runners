@@ -15,8 +15,14 @@ let
   hostAddress = "${cfg.network.subnet}.1";
   nixDaemonPort = 5000;
   controlPort = 5001;
-  package = pkgs.callPackage ../../../package.nix { };
+  package = pkgs.callPackage ../../../package.nix { vmkit = cfg.vmkitSource; };
   isQemu = cfg.backend == "qemu";
+  # The runners' vmkit memory pool, and the status files of the pools that
+  # come first on the host.
+  poolName = "microvm-github-runners";
+  ahead = lib.mapAttrsToList (_: p: p.statusFile) (
+    lib.filterAttrs (_: p: p.rank == "first") config.services.vmkit.memory.pools
+  );
   commonFlags = map (url: "--url=${url}") cfg.urls ++ [
     "--name=${cfg.name}"
     "--labels=${lib.concatStringsSep "," cfg.labels}"
@@ -48,6 +54,7 @@ let
       {
         microvm-github-runner = {
           inherit nixDaemonPort controlPort bootMemMiB;
+          kvm = cfg.nestedVirtualization;
           maxMemMiB = bootMemMiB + hotplugMemMiB;
         };
       }
@@ -271,10 +278,31 @@ in
     };
     memReservePercent = lib.mkOption {
       type = lib.types.ints.between 0 99;
-      default = 10;
+      default = config.services.vmkit.memory.reservePercent;
+      defaultText = lib.literalExpression "config.services.vmkit.memory.reservePercent";
       description = ''
         cloud-hypervisor only. Share of host memory, at least 2 GiB, left to
         the host: no VM boots and no VM grows into it.
+      '';
+    };
+    nestedVirtualization = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        cloud-hypervisor only. Give runner VMs hardware virtualization and
+        /dev/kvm, so jobs can boot VMs of their own, e.g. NixOS VM tests run
+        inside the job rather than through the host's Nix daemon. Off, the
+        guests see no virtualization extensions.
+      '';
+    };
+    guaranteedMemGiB = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        cloud-hypervisor only, with a `first` pool in
+        `services.vmkit.memory.pools` on the same host: runners only boot into
+        and grow into memory first pools leave, except for this much, which
+        runners may hold whatever they want.
       '';
     };
     diskReservePercent = lib.mkOption {
@@ -354,6 +382,11 @@ in
       default = { };
     };
 
+    vmkitSource = lib.mkOption {
+      type = lib.types.path;
+      internal = true;
+      description = "vmkit's source, which microvm-scaleset builds against; `nixosModules.default` sets it.";
+    };
     microvmGuestModule = lib.mkOption {
       type = lib.types.nullOr lib.types.raw;
       default = null;
@@ -479,6 +512,11 @@ in
       })
 
       (lib.mkIf (!isQemu) {
+        services.vmkit.memory.pools.${poolName} = {
+          rank = "yielding";
+          guaranteedGiB = cfg.guaranteedMemGiB;
+        };
+
         assertions = [
           {
             assertion = qemuOnlySet == [ ];
@@ -521,6 +559,14 @@ in
                 "--nix-daemon-port=${toString nixDaemonPort}"
                 "--control-port=${toString controlPort}"
               ]
+              ++ lib.optional cfg.nestedVirtualization "--nested-virtualization"
+              ++ lib.optionals (ahead != [ ]) (
+                [
+                  "--memory-status=${config.services.vmkit.memory.pools.${poolName}.statusFile}"
+                  "--guaranteed-mem-gib=${toString cfg.guaranteedMemGiB}"
+                ]
+                ++ map (f: "--ahead-status=${f}") ahead
+              )
             );
           };
           tmpfiles.rules = [ "d ${cfg.workDir} 0750 root kvm -" ];
@@ -528,6 +574,15 @@ in
       })
 
       {
+        # VMs reach the internet, nothing on the host or private networks.
+        services.vmkit = {
+          inherit (cfg.network) externalInterface;
+          networks.microvm = {
+            inherit (cfg.network) subnet;
+            interface = cfg.network.bridge;
+          };
+        };
+
         assertions = [
           {
             assertion = cfg.name != "";
@@ -590,32 +645,6 @@ in
             "interface-name:${cfg.network.bridge}"
             "interface-name:ghrunner*"
           ];
-          nat = {
-            enable = true;
-            internalInterfaces = [ cfg.network.bridge ];
-            inherit (cfg.network) externalInterface;
-          };
-          # VMs reach the internet, nothing on the host or private networks.
-          firewall = {
-            extraCommands = ''
-              iptables -N microvm-in 2>/dev/null || iptables -F microvm-in
-              iptables -A microvm-in -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-              iptables -A microvm-in -j DROP
-              iptables -D INPUT -i ${cfg.network.bridge} -j microvm-in 2>/dev/null || true
-              iptables -I INPUT -i ${cfg.network.bridge} -j microvm-in
-
-              iptables -N microvm-fwd 2>/dev/null || iptables -F microvm-fwd
-              for net in 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16; do
-                iptables -A microvm-fwd -d "$net" -j DROP
-              done
-              iptables -D FORWARD -i ${cfg.network.bridge} -j microvm-fwd 2>/dev/null || true
-              iptables -I FORWARD -i ${cfg.network.bridge} -j microvm-fwd
-            '';
-            extraStopCommands = ''
-              iptables -D INPUT -i ${cfg.network.bridge} -j microvm-in 2>/dev/null || true
-              iptables -D FORWARD -i ${cfg.network.bridge} -j microvm-fwd 2>/dev/null || true
-            '';
-          };
         };
       }
     ]

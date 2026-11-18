@@ -67,12 +67,12 @@ func TestControlChannelStats(t *testing.T) {
 		t.Fatalf("stats reply = %v", got)
 	}
 	a.mu.Lock()
-	s := a.mem.stats
+	s := a.mem.Stats
 	a.mu.Unlock()
 	if s.MemAvailableKiB != 1<<20 || s.MemTotalKiB != 4<<20 || s.PSISomeAvg10 != 7.5 || s.PSIFullAvg10 != 0.25 || s.ReceivedAt.IsZero() {
 		t.Fatalf("recorded stats = %+v", s)
 	}
-	if !b.mem.stats.ReceivedAt.IsZero() {
+	if !b.mem.Stats.ReceivedAt.IsZero() {
 		t.Fatal("stats landed on the wrong VM")
 	}
 	for _, bad := range []string{
@@ -87,7 +87,7 @@ func TestControlChannelStats(t *testing.T) {
 			t.Fatalf("%s accepted: %v", bad, got)
 		}
 	}
-	if !b.mem.stats.ReceivedAt.IsZero() {
+	if !b.mem.Stats.ReceivedAt.IsZero() {
 		t.Fatal("invalid stats were recorded")
 	}
 }
@@ -114,7 +114,7 @@ func TestControlStatsCarryTheGivenTime(t *testing.T) {
 	vm := &chVM{}
 	at := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 	reply, _ := answerControl(bufio.NewReader(strings.NewReader(`{"op":"stats","memAvailableKiB":1,"memTotalKiB":4,"psiSomeAvg10":0,"psiFullAvg10":0}`+"\n")), vm, at)
-	if !reply.OK || !vm.mem.stats.ReceivedAt.Equal(at) {
-		t.Fatalf("reply %+v, receivedAt %v", reply, vm.mem.stats.ReceivedAt)
+	if !reply.OK || !vm.mem.Stats.ReceivedAt.Equal(at) {
+		t.Fatalf("reply %+v, receivedAt %v", reply, vm.mem.Stats.ReceivedAt)
 	}
 }
