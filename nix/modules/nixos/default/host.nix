@@ -48,6 +48,7 @@ let
       {
         microvm-github-runner = {
           inherit nixDaemonPort controlPort bootMemMiB;
+          kvm = cfg.nestedVirtualization;
           maxMemMiB = bootMemMiB + hotplugMemMiB;
         };
       }
@@ -275,6 +276,16 @@ in
       description = ''
         cloud-hypervisor only. Share of host memory, at least 2 GiB, left to
         the host: no VM boots and no VM grows into it.
+      '';
+    };
+    nestedVirtualization = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        cloud-hypervisor only. Give runner VMs hardware virtualization and
+        /dev/kvm, so jobs can boot VMs of their own, e.g. NixOS VM tests run
+        inside the job rather than through the host's Nix daemon. Off, the
+        guests see no virtualization extensions.
       '';
     };
     diskReservePercent = lib.mkOption {
@@ -526,6 +537,7 @@ in
                 "--nix-daemon-port=${toString nixDaemonPort}"
                 "--control-port=${toString controlPort}"
               ]
+              ++ lib.optional cfg.nestedVirtualization "--nested-virtualization"
             );
           };
           tmpfiles.rules = [ "d ${cfg.workDir} 0750 root kvm -" ];

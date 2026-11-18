@@ -25,6 +25,9 @@ type chConfig struct {
 	diskReservePercent float64
 	nixDaemonPort      int
 	controlPort        int
+	// nested exposes hardware virtualization to the guests, which then get
+	// /dev/kvm.
+	nested bool
 }
 
 // guestManifest is what the host module tells the controller about the

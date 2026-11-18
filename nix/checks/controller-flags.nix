@@ -12,6 +12,7 @@ let
 in
 pkgs.runCommand "controller-flags" { } ''
   ${execStart "cloud-hypervisor" { }} --help
+  ${execStart "cloud-hypervisor" { nestedVirtualization = true; }} --help
   ${execStart "qemu" { poolSize = 2; }} --help
   touch $out
 ''

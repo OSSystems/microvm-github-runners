@@ -77,6 +77,7 @@ func parseConfig(args []string) (config, error) {
 	f.Float64Var(&c.ch.diskReservePercent, "disk-reserve-percent", 10, "cloud-hypervisor: free space kept on --work-dir, percent")
 	f.IntVar(&c.ch.nixDaemonPort, "nix-daemon-port", 5000, "cloud-hypervisor: guest vsock port of the Nix daemon")
 	f.IntVar(&c.ch.controlPort, "control-port", 5001, "cloud-hypervisor: guest vsock port of the control channel")
+	f.BoolVar(&c.ch.nested, "nested-virtualization", false, "cloud-hypervisor: give runner VMs /dev/kvm (nested virtualization)")
 	f.Func("url", "organization URL; repeat to share the pool", func(v string) error { c.urls = append(c.urls, v); return nil })
 	f.StringVar(&c.name, "name", "", "scale set name in every organization")
 	f.StringVar(&c.labels, "labels", "", "comma-separated labels (defaults to the name)")

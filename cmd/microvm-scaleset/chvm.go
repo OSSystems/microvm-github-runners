@@ -64,14 +64,13 @@ func buildVMSpec(c config, m guestManifest, runner string, addr vmAddress, cpus 
 		NixTarget: nixDaemonSocket,
 	}
 	vm := ch.VM{
-		Binary:    m.CloudHypervisor,
-		APISocket: apiSocket(dir),
-		Kernel:    m.Kernel,
-		Initramfs: m.Initrd,
-		Cmdline:   strings.TrimSpace(m.Cmdline + " ghr.name=" + runner + " ghr.addr=" + addr.ip() + "/24 ghr.gw=" + addr.gateway()),
-		CPUs:      cpus,
-		// cloud-hypervisor's default.
-		Nested:      true,
+		Binary:      m.CloudHypervisor,
+		APISocket:   apiSocket(dir),
+		Kernel:      m.Kernel,
+		Initramfs:   m.Initrd,
+		Cmdline:     strings.TrimSpace(m.Cmdline + " ghr.name=" + runner + " ghr.addr=" + addr.ip() + "/24 ghr.gw=" + addr.gateway()),
+		CPUs:        cpus,
+		Nested:      c.ch.nested,
 		MemoryMiB:   m.BootMemMiB,
 		HotplugMiB:  m.HotplugMemMiB,
 		Disks:       []ch.Disk{{Path: diskImage(dir), Direct: true}},
